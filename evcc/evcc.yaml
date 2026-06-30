@@ -1,1 +1,5 @@
-test
+site:
+  title: Project Phoenix
+  language: nl
+
+log: debug
