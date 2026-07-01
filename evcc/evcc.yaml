@@ -1,17 +1,18 @@
 site:
   title: Project Phoenix
 
+  meters:
+    grid: grid_youless
+
 log: debug
 
 meters:
- # Grid
+  # Grid
   - name: grid_youless
     type: template
     template: youless
     usage: grid
     host: 192.168.0.218
-  # PV
-  # Battery
 
 chargers:
 
