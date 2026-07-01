@@ -2,3 +2,19 @@ site:
   title: Project Phoenix
 
 log: debug
+
+meters:
+ # Grid
+  - name: grid_youless
+    type: template
+    template: youless
+    usage: grid
+    host: 192.168.0.218
+  # PV
+  # Battery
+
+chargers:
+
+vehicles:
+
+loadpoints:
