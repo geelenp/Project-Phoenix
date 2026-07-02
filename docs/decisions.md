@@ -24,3 +24,10 @@ Alle netmetingen komen uitsluitend van de YouLess LS120.
 ## Gevolgen
 
 Alle laadbeslissingen gebruiken uitsluitend deze meting.
+
+# ADR-0002 – Last Known Good Values
+
+## Beslissing
+
+Voor databronnen waarvan tijdelijke communicatie-uitval verwacht wordt (zoals de SMA SBS) gebruikt Project Phoenix een Last Known Good-mechanisme met een maximale geldigheidsduur per datatype.
+
