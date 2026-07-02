@@ -15,15 +15,15 @@ meters:
     host: 192.168.0.218
 
   # PV
-- name: pv_sbs
-  type: template
-  template: sunspec-inverter
-  usage: pv
+  - name: pv_sbs
+    type: template
+    template: sunspec-inverter
+    usage: pv
 
-  modbus: tcpip
-  id: 3
-  host: 192.168.0.201
-  port: 502
+    modbus: tcpip
+    id: 3
+    host: 192.168.0.201
+    port: 502
 
 chargers:
 
