@@ -1,0 +1,104 @@
+package core
+
+import (
+	"cmp"
+	"fmt"
+	"slices"
+
+	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/util/config"
+)
+
+var (
+	status   = map[bool]string{false: "disable", true: "enable"}
+	presence = map[bool]string{false: "✗", true: "✓"}
+
+	// Voltage global value
+	Voltage float64
+)
+
+// powerToCurrent is a helper function to convert power to per-phase current
+func powerToCurrent(power float64, phases int) float64 {
+	if Voltage == 0 {
+		panic("Voltage is not set")
+	}
+	return power / (float64(phases) * Voltage)
+}
+
+// currentToPower is a helper function to convert current to sum power
+func currentToPower(current float64, phases int) float64 {
+	if Voltage == 0 {
+		panic("Voltage is not set")
+	}
+	return current * float64(phases) * Voltage
+}
+
+// printPtr returns a string representation of a pointer value
+func printPtr[T any](format string, v *T) string {
+	if v == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf(format, *v)
+}
+
+func ptrValueEqual[T comparable](a, b *T) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+
+	return a == nil && b == nil || (*a) == (*b)
+}
+
+// hasFeature returns true if features are supported and given feature present
+func hasFeature(a any, f api.Feature) bool {
+	c, ok := api.Cap[api.FeatureDescriber](a)
+	return ok && slices.Contains(c.Features(), f)
+}
+
+// deviceProperties returns the common device data for the given reference
+func deviceProperties[T any](dev config.Device[T]) config.Properties {
+	if d, ok := dev.(config.ConfigurableDevice[T]); ok {
+		return d.Properties()
+	}
+	return config.Properties{}
+}
+
+// deviceTitleOrName returns device title or name
+func deviceTitleOrName[T any](dev config.Device[T]) string {
+	return cmp.Or(deviceProperties(dev).Title, dev.Config().Name)
+}
+
+// circuitMaxPower returns a circuits power limit
+func circuitMaxPower(circuit api.Circuit) float64 {
+	if circuit == nil {
+		return 0
+	}
+
+	return circuit.GetMaxPower()
+}
+
+// hemsDimmed returns the HEMS dim status, nil-safe
+func hemsDimmed(hems api.HEMS) *bool {
+	if hems == nil {
+		return nil
+	}
+
+	return hems.Dimmed()
+}
+
+// hemsCurtailed returns the HEMS curtail percent, nil-safe
+func hemsCurtailed(hems api.HEMS) *int {
+	if hems == nil {
+		return nil
+	}
+
+	return hems.CurtailedPercent()
+}
+
+// nonZeroEnergy reports a zero lifetime energy reading as api.ErrNotAvailable.
+func nonZeroEnergy(f float64, err error) (float64, error) {
+	if err == nil && f == 0 {
+		return 0, api.ErrNotAvailable
+	}
+	return f, err
+}

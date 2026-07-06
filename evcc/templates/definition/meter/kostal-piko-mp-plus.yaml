@@ -1,0 +1,26 @@
+template: kostal-piko-mp-plus
+products:
+  - brand: Kostal
+    description:
+      generic: Piko MP Plus
+  - brand: Steca
+    description:
+      generic: coolcept fleX
+params:
+  - name: usage
+    choice: ["grid", "pv"]
+  - name: host
+render: |
+  type: custom
+  power:
+  {{- if eq .usage "pv" }}
+    source: http
+    uri: http://{{ .host }}/measurements.xml
+    jq: .root.Device.Measurements.Measurement[] | select(.attrType == "AC_Power") | if has ("attrValue") then .attrValue else "0" end | tonumber
+  {{- end }}
+  {{- if eq .usage "grid" }}
+    source: http
+    uri: http://{{ .host }}/measurements.xml
+    jq: .root.Device.Measurements.Measurement[] | select(.attrType == "GridPower") | if has ("attrValue") then .attrValue else "0" end | tonumber
+    scale: -1
+  {{- end }}

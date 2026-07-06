@@ -1,0 +1,14 @@
+template: pulsares
+products:
+  - brand: Pulsares
+    description:
+      generic: SimpleBox
+capabilities: ["dim"]
+params:
+  - name: modbus
+    choice: ["rs485"]
+    baudrate: 9600
+    comset: 8N1
+render: |
+  type: pulsares
+  {{- include "modbus" . }}

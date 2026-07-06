@@ -1,0 +1,75 @@
+template: siemens-7kt1665
+products:
+  - brand: Siemens
+    description:
+      generic: 7KT1665
+  - brand: Siemens
+    description:
+      generic: 7KT1666 (MID)
+params:
+  - name: usage
+    choice: ["grid", "charge"]
+  - name: modbus
+    choice: ["rs485", "tcpip"]
+render: |
+  type: custom
+  power:
+    source: modbus
+    {{- include "modbus" . | indent 2 }}
+    register:
+      address: 57
+      type: input
+      decode: int32
+    scale: 0.01
+  energy:
+    source: modbus
+    {{- include "modbus" . | indent 2 }}
+    register:
+      address: 6687
+      type: input
+      decode: uint32
+    scale: 0.001
+  currents:
+  - source: modbus
+    {{- include "modbus" . | indent 2 }}
+    register:
+      address: 7
+      type: input
+      decode: uint32
+    scale: 0.0001
+  - source: modbus
+    {{- include "modbus" . | indent 2 }}
+    register:
+      address: 9
+      type: input
+      decode: uint32
+    scale: 0.0001
+  - source: modbus
+    {{- include "modbus" . | indent 2 }}
+    register:
+      address: 11
+      type: input
+      decode: uint32
+    scale: 0.0001
+  voltages:
+  - source: modbus
+    {{- include "modbus" . | indent 2 }}
+    register:
+      address: 1
+      type: input
+      decode: uint32
+    scale: 0.01
+  - source: modbus
+    {{- include "modbus" . | indent 2 }}
+    register:
+      address: 3
+      type: input
+      decode: uint32
+    scale: 0.01
+  - source: modbus
+    {{- include "modbus" . | indent 2 }}
+    register:
+      address: 5
+      type: input
+      decode: uint32
+    scale: 0.01

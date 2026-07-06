@@ -1,0 +1,128 @@
+package fixed
+
+import (
+	"slices"
+)
+
+type Zone struct {
+	Price  float64
+	Days   []Day
+	Hours  TimeRange
+	Months []Month
+}
+
+type Zones []Zone
+
+// ZoneSpec is the un-parsed config form of a zone (string day/hour/month fields).
+type ZoneSpec struct {
+	Price               float64
+	Days, Hours, Months string
+}
+
+// ParseZones expands ZoneSpecs into Zones, one per comma-separated hour range.
+func ParseZones(specs []ZoneSpec) (Zones, error) {
+	var zones Zones
+	for _, z := range specs {
+		days, err := ParseDays(z.Days)
+		if err != nil {
+			return nil, err
+		}
+
+		months, err := ParseMonths(z.Months)
+		if err != nil {
+			return nil, err
+		}
+
+		hours, err := ParseTimeRanges(z.Hours)
+		if err != nil && z.Hours != "" {
+			return nil, err
+		}
+
+		if len(hours) == 0 {
+			zones = append(zones, Zone{
+				Price:  z.Price,
+				Days:   days,
+				Months: months,
+			})
+			continue
+		}
+
+		for _, h := range hours {
+			zones = append(zones, Zone{
+				Price:  z.Price,
+				Days:   days,
+				Months: months,
+				Hours:  h,
+			})
+		}
+	}
+	return zones, nil
+}
+
+// implement sort.Interface
+func (r Zones) Len() int {
+	return len(r)
+}
+
+func (r Zones) Less(i, j int) bool {
+	if r[i].Hours.From.Minutes() == r[j].Hours.From.Minutes() {
+		return r[i].Hours.To.Minutes() > r[j].Hours.To.Minutes()
+	}
+	return r[i].Hours.From.Minutes() < r[j].Hours.From.Minutes()
+}
+
+func (r Zones) Swap(i, j int) {
+	r[i], r[j] = r[j], r[i]
+}
+
+// ForDay returns the zones for given day in ascending order
+func (r Zones) ForDayAndMonth(day Day, month Month) Zones {
+	var zones Zones
+	for _, z := range r {
+		if (slices.Contains(z.Days, day) || len(z.Days) == 0) && (slices.Contains(z.Months, month) || len(z.Months) == 0) {
+			zones = append(zones, z)
+		}
+	}
+
+	return zones
+}
+
+// TimeTableMarkers returns list of zone start/end markers
+func (r Zones) TimeTableMarkers() []HourMin {
+	res := []HourMin{{Hour: 0, Min: 0}}
+
+	for _, z := range r {
+		if !z.Hours.From.IsNil() {
+			if !slices.Contains(res, z.Hours.From) {
+				res = append(res, z.Hours.From)
+			}
+		}
+		if !z.Hours.To.IsNil() {
+			if !slices.Contains(res, z.Hours.To) {
+				res = append(res, z.Hours.To)
+			}
+		}
+	}
+
+HOURS:
+	// 1hr intervals
+	for hour := range 24 {
+		for _, m := range res {
+			if m.Hour == hour && m.Min == 0 {
+				continue HOURS
+			}
+		}
+
+		// hour is missing
+		for i, m := range res {
+			if m.Hour >= hour {
+				res = slices.Insert(res, i, HourMin{Hour: hour, Min: 0})
+				continue HOURS
+			}
+		}
+
+		res = append(res, HourMin{Hour: hour, Min: 0})
+	}
+
+	return res
+}

@@ -1,0 +1,10 @@
+site:
+  title: Phoenix Test
+
+chargers:
+  - name: sma
+    type: template
+    template: semp-sma
+
+    uri: http://192.168.0.135/SEMP
+

@@ -1,0 +1,311 @@
+package charger
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/benbjohnson/clock"
+	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/charger/ocpp"
+	ocppapi "github.com/lorenzodonini/ocpp-go/ocpp"
+	ocpp16 "github.com/lorenzodonini/ocpp-go/ocpp1.6"
+	"github.com/lorenzodonini/ocpp-go/ocpp1.6/core"
+	"github.com/lorenzodonini/ocpp-go/ocpp1.6/firmware"
+	"github.com/lorenzodonini/ocpp-go/ocpp1.6/localauth"
+	"github.com/lorenzodonini/ocpp-go/ocpp1.6/remotetrigger"
+	"github.com/lorenzodonini/ocpp-go/ocpp1.6/reservation"
+	"github.com/lorenzodonini/ocpp-go/ocpp1.6/smartcharging"
+	"github.com/lorenzodonini/ocpp-go/ocpp1.6/types"
+	"github.com/lorenzodonini/ocpp-go/ocppj"
+	"github.com/lorenzodonini/ocpp-go/ws"
+	"github.com/stretchr/testify/suite"
+)
+
+const ocppTestConnectTimeout = 10 * time.Second
+
+// ocppTestUrl is derived from the actual bound port in SetupSuite: the central
+// system binds an ephemeral port to avoid bind failures when the fixed default
+// port is already in use on the CI runner.
+var ocppTestUrl string
+
+func TestMain(m *testing.M) {
+	// bind the OCPP central system to an ephemeral port so this test binary
+	// does not contend with the charger/ocpp package test binary for the fixed
+	// default port when both run in parallel under `go test ./...`
+	ocpp.NewServer(ocpp.Config{Port: 0}, "")
+	os.Exit(m.Run())
+}
+
+func TestOcpp(t *testing.T) {
+	suite.Run(t, new(ocppTestSuite))
+}
+
+type ocppTestSuite struct {
+	suite.Suite
+	clock  *clock.Mock
+	logger *ocppLogger
+}
+
+func (suite *ocppTestSuite) SetupSuite() {
+	ocpp.Timeout = 5 * time.Second
+
+	// the simulated charge points never send a spontaneous BootNotification,
+	// so shorten the proactive-trigger delay to avoid waiting 5s per charge point
+	ocpp.TriggerBootDelay = 100 * time.Millisecond
+
+	// setup cs so we can overwrite logger afterwards
+	cs, err := ocpp.Instance()
+	suite.Require().NoError(err, "instance")
+	suite.NotNil(cs)
+
+	suite.logger = &ocppLogger{t: suite.T()}
+	ocppj.SetLogger(suite.logger)
+
+	suite.Require().NotZero(ocpp.Port(), "central system did not bind")
+	ocppTestUrl = fmt.Sprintf("ws://localhost:%d", ocpp.Port())
+
+	suite.clock = clock.NewMock()
+}
+
+func (suite *ocppTestSuite) TearDownSuite() {
+	suite.logger.close()
+}
+
+func (suite *ocppTestSuite) startChargePoint(id string, connectorId int) (ocpp16.ChargePoint, *ocppj.Client) {
+	// Buffered generously: the handlers in ocpp_test_handler.go send to
+	// triggerC synchronously (via defer) on the charge point's WebSocket
+	// read-loop goroutine. If that send blocks, the read loop cannot deliver
+	// the CALL_RESULT for the CP→CS request the drain goroutine is waiting
+	// on, deadlocking the test. The buffer keeps the send from blocking
+	// until the drain catches up.
+	handler := &ChargePointHandler{
+		triggerC: make(chan remotetrigger.MessageTrigger, 16),
+	}
+
+	// ocppj endpoint with handler
+	client := ws.NewClient()
+	client.SetRequestedSubProtocol(types.V16Subprotocol)
+	dispatcher := ocppj.NewDefaultClientDispatcher(ocppj.NewFIFOClientQueue(0))
+	endpoint := ocppj.NewClient(id, client, dispatcher, nil, core.Profile, localauth.Profile, firmware.Profile, reservation.Profile, remotetrigger.Profile, smartcharging.Profile)
+
+	// create charge point with handler
+	cp := ocpp16.NewChargePoint(id, endpoint, client)
+	cp.SetCoreHandler(handler)
+	cp.SetRemoteTriggerHandler(handler)
+	cp.SetSmartChargingHandler(handler)
+
+	// let cs handle the trigger messages; exit on done so we do not leak a
+	// drain goroutine into subsequent subtests on the shared ocpp.Instance().
+	// triggerC is deliberately left open: the handlers in ocpp_test_handler.go
+	// send to it from the charge point's read loop, which we do not synchronize
+	// with on shutdown, so closing it could panic on `send on closed channel`.
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		for {
+			select {
+			case <-done:
+				return
+			case msg := <-handler.triggerC:
+				suite.handleTrigger(cp, connectorId, msg)
+			}
+		}
+	}()
+
+	suite.T().Cleanup(func() {
+		if cp.IsConnected() {
+			cp.Stop()
+		}
+		close(done)
+		// wait for the drain goroutine to fully exit before the test method
+		// returns: handleTrigger logs via suite.T(), which panics if called
+		// after the test has completed.
+		<-finished
+	})
+
+	return cp, endpoint
+}
+
+func (suite *ocppTestSuite) handleTrigger(cp ocpp16.ChargePoint, connectorId int, msg remotetrigger.MessageTrigger) {
+	switch msg {
+	case core.BootNotificationFeatureName:
+		if _, err := cp.BootNotification("model", "vendor"); err != nil {
+			suite.T().Log("BootNotification:", err)
+		}
+
+	case core.ChangeAvailabilityFeatureName:
+		fallthrough
+
+	case core.StatusNotificationFeatureName:
+		if _, err := cp.StatusNotification(connectorId, core.NoError, core.ChargePointStatusCharging); err != nil {
+			suite.T().Log("StatusNotification:", err)
+		}
+
+	case core.MeterValuesFeatureName:
+		if _, err := cp.MeterValues(connectorId, []types.MeterValue{
+			{
+				Timestamp: types.NewDateTime(suite.clock.Now()),
+				SampledValue: []types.SampledValue{
+					{Measurand: types.MeasurandPowerActiveImport, Value: "1000"},
+					{Measurand: types.MeasurandEnergyActiveImportRegister, Value: "1.2", Unit: "kWh"},
+				},
+			},
+		}); err != nil {
+			suite.T().Log("MeterValues:", err)
+		}
+	}
+}
+
+func (suite *ocppTestSuite) TestConnect() {
+	// 1st charge point- remote
+	cp1, _ := suite.startChargePoint("test-1", 1)
+	suite.Require().NoError(cp1.Start(ocppTestUrl))
+	suite.Require().True(cp1.IsConnected())
+
+	// 1st charge point- local
+	c1, err := NewOCPP(suite.T().Context(), "test-1", 1, "", "", 0, false, false, false, true, false, ocppTestConnectTimeout)
+	suite.Require().NoError(err)
+
+	// status and meter values
+	{
+		suite.clock.Add(ocpp.Timeout)
+		c1.conn.TestClock(suite.clock)
+
+		// status
+		_, err = c1.Status()
+		suite.Require().NoError(err)
+	}
+
+	// takeover
+	{
+		expectedTxn := 99
+
+		// always accept stopping unknown transaction, see https://github.com/evcc-io/evcc/pull/13990
+		_, err := cp1.StopTransaction(0, types.NewDateTime(suite.clock.Now()), expectedTxn)
+		suite.Require().NoError(err)
+
+		_, err = cp1.MeterValues(1, []types.MeterValue{
+			{
+				Timestamp: types.NewDateTime(suite.clock.Now()),
+				SampledValue: []types.SampledValue{
+					{Measurand: types.MeasurandPowerActiveImport, Value: "1000"},
+				},
+			},
+		}, func(request *core.MeterValuesRequest) {
+			request.TransactionId = &expectedTxn
+		})
+		suite.Require().NoError(err)
+
+		conn1 := c1.Connector()
+		txnId, err := conn1.TransactionID()
+		suite.Require().NoError(err)
+		suite.Equal(expectedTxn, txnId)
+
+		res, err := cp1.StopTransaction(0, types.NewDateTime(suite.clock.Now()), expectedTxn)
+		suite.Require().NoError(err)
+		suite.Equal(types.AuthorizationStatusAccepted, res.IdTagInfo.Status)
+	}
+
+	// 2nd charge point - remote
+	cp2, _ := suite.startChargePoint("test-2", 1)
+	suite.Require().NoError(cp2.Start(ocppTestUrl))
+	suite.Require().True(cp2.IsConnected())
+
+	// 2nd charge point - local
+	c2, err := NewOCPP(suite.T().Context(), "test-2", 1, "", "", 0, false, false, false, true, false, ocppTestConnectTimeout)
+	suite.Require().NoError(err)
+
+	{
+		suite.clock.Add(ocpp.Timeout)
+		c2.conn.TestClock(suite.clock)
+
+		// status
+		_, err = c2.Status()
+		suite.Require().NoError(err)
+	}
+
+	// error on unconfigured 2nd charge point
+	cp3, _ := suite.startChargePoint("unconfigured", 1)
+	_, err = cp3.BootNotification("model", "vendor")
+	suite.Require().Error(err)
+
+	// disconnect charge point
+	cp2.Stop()
+	suite.Require().False(cp2.IsConnected())
+
+	t := time.NewTimer(100 * time.Millisecond)
+WAIT_DISCONNECT:
+	for {
+		select {
+		case <-t.C:
+			suite.Fail("disconnect timeout")
+		case <-time.After(10 * time.Millisecond):
+			if _, err := c2.Status(); errors.Is(err, api.ErrTimeout) {
+				break WAIT_DISCONNECT
+			}
+		}
+	}
+}
+
+func (suite *ocppTestSuite) TestAutoStart() {
+	// 1st charge point- remote
+	cp1, _ := suite.startChargePoint("test-3", 1)
+	suite.Require().NoError(cp1.Start(ocppTestUrl))
+	suite.Require().True(cp1.IsConnected())
+
+	// 1st charge point- local
+	c1, err := NewOCPP(suite.T().Context(), "test-3", 1, "", "", 0, false, false, false, false, false, ocppTestConnectTimeout)
+	suite.Require().NoError(err)
+
+	// status and meter values
+	{
+		suite.clock.Add(ocpp.Timeout)
+		c1.conn.TestClock(suite.clock)
+	}
+
+	// acquire
+	{
+		expectedIdTag := "tag"
+
+		// always accept stopping unknown transaction, see https://github.com/evcc-io/evcc/pull/13990
+		_, err := cp1.StartTransaction(1, expectedIdTag, 0, types.NewDateTime(suite.clock.Now()))
+		suite.Require().NoError(err)
+
+		id, err := c1.Identify()
+		suite.Require().NoError(err)
+		suite.Require().Equal(expectedIdTag, id)
+
+		conn1 := c1.Connector()
+		_, err = conn1.TransactionID()
+		suite.Require().NoError(err)
+	}
+
+	err = c1.Enable(true)
+	suite.Require().NoError(err)
+
+	err = c1.Enable(false)
+	suite.Require().NoError(err)
+}
+
+func (suite *ocppTestSuite) TestTimeout() {
+	// 1st charge point- remote
+	cp1, ocppjClient := suite.startChargePoint("test-4", 1)
+	suite.Require().NoError(cp1.Start(ocppTestUrl))
+	suite.Require().True(cp1.IsConnected())
+
+	handler := ocppjClient.GetRequestHandler()
+	ocppjClient.SetRequestHandler(func(request ocppapi.Request, requestId string, action string) {
+		if action != core.ChangeAvailabilityFeatureName {
+			handler(request, requestId, action)
+		}
+	})
+
+	// 1st charge point- local
+	_, err := NewOCPP(suite.T().Context(), "test-4", 1, "", "", 0, false, false, false, false, false, ocppTestConnectTimeout)
+
+	suite.Require().NoError(err)
+}

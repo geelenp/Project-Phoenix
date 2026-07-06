@@ -1,0 +1,34 @@
+template: tronity
+products:
+  - description:
+      generic: Tronity
+group: generic
+requirements:
+  evcc: ["sponsorship"]
+params:
+  - preset: vehicle-common
+  - preset: vehicle-online
+  - name: clientid
+    description:
+      generic: Tronity API Client ID
+    help:
+      de: Einrichtung unter [app.tronity.tech](https://app.tronity.tech)
+      en: Setup at [app.tronity.tech](https://app.tronity.tech)
+  - name: clientsecret
+    description:
+      generic: Tronity API Client Secret
+    help:
+      de: Einrichtung unter [app.tronity.tech](https://app.tronity.tech)
+      en: Setup at [app.tronity.tech](https://app.tronity.tech)
+  - name: vin
+  - name: cache
+    default: 15m
+render: |
+  type: tronity
+  vin: {{ .vin }}
+  credentials:
+    id: {{ .clientid }}
+    secret: {{ .clientsecret }}
+  {{ include "vehicle-common" . }}
+  cache: {{ .cache }}
+  {{ include "vehicle-features" . }}

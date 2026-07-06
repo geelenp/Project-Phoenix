@@ -1,0 +1,374 @@
+<template>
+	<GenericModal
+		id="sessionDetailsModal"
+		ref="modal"
+		:title="$t('session.title')"
+		data-testid="session-details"
+	>
+		<div v-if="session">
+			<table class="table align-middle">
+				<tbody>
+					<tr>
+						<th>
+							<label for="sessionDetailsLoadpoint">
+								{{ $t("sessions.loadpoint") }}
+							</label>
+						</th>
+						<td>
+							<CustomSelect
+								id="sessionDetailsLoadpoint"
+								class="options"
+								:options="loadpointOptions"
+								:selected="session.loadpoint"
+								@change="changeLoadpoint($event.target.value)"
+							>
+								<span class="flex-grow-1 text-truncate loadpoint-name">
+									{{ session.loadpoint || $t("main.loadpoint.fallbackName") }}
+								</span>
+							</CustomSelect>
+						</td>
+					</tr>
+					<tr>
+						<th>
+							<label for="sessionDetailsVehicle">
+								{{ $t("sessions.vehicle") }}
+							</label>
+						</th>
+						<td>
+							<VehicleOptions
+								id="sessionDetailsVehicle"
+								class="options"
+								:vehicleOptions="vehicleOptions"
+								connected
+								:selected="session.vehicle"
+								@change-vehicle="changeVehicle"
+								@remove-vehicle="removeVehicle"
+							>
+								<span class="flex-grow-1 text-truncate vehicle-name">
+									{{
+										session.vehicle
+											? session.vehicle
+											: $t("main.vehicle.unknown")
+									}}
+								</span>
+							</VehicleOptions>
+						</td>
+					</tr>
+					<tr data-testid="session-details-date">
+						<th class="align-baseline">
+							{{ $t("session.date") }}
+						</th>
+						<td>
+							<template v-if="session.created">
+								{{ fmtFullDateTime(new Date(session.created), false) }}
+							</template>
+							<br />
+							<template v-if="session.finished">
+								{{ fmtFullDateTime(new Date(session.finished), false) }}
+							</template>
+						</td>
+					</tr>
+					<tr data-testid="session-details-energy">
+						<th class="align-baseline">
+							{{ $t("sessions.energy") }}
+						</th>
+						<td>
+							{{
+								fmtWh(
+									chargedEnergy,
+									chargedEnergy >= 1e3 ? POWER_UNIT.KW : POWER_UNIT.AUTO
+								)
+							}}
+							<div v-if="session.chargeDuration">
+								{{ fmtDurationNs(session.chargeDuration) }}
+								(~{{ fmtW(avgPower) }})
+							</div>
+						</td>
+					</tr>
+					<tr v-if="session.solarPercentage != null" data-testid="session-details-solar">
+						<th class="align-baseline">
+							{{ $t("sessions.solar") }}
+						</th>
+						<td>
+							{{ fmtPercentage(session.solarPercentage, 1) }}
+							({{ fmtWh(solarEnergy, POWER_UNIT.AUTO) }})
+						</td>
+					</tr>
+					<tr v-if="session.price != null" data-testid="session-details-price">
+						<th class="align-baseline">
+							{{ $t("session.price") }}
+						</th>
+						<td>
+							{{ fmtMoney(session.price, currency) }}
+							{{ fmtCurrencySymbol(currency) }}<br />
+							{{ fmtPricePerKWh(session.pricePerKWh || 0, currency) }}
+						</td>
+					</tr>
+					<tr v-if="session.co2PerKWh != null" data-testid="session-details-co2">
+						<th class="align-baseline">
+							{{ $t("session.co2") }}
+						</th>
+						<td>
+							{{ totalCo2Formatted }}<br />
+							{{ fmtCo2Medium(session.co2PerKWh) }}
+						</td>
+					</tr>
+					<tr v-if="socRange" data-testid="session-details-soc">
+						<th class="align-baseline">
+							{{ $t("session.soc") }}
+						</th>
+						<td>
+							{{ socRange }}
+						</td>
+					</tr>
+					<tr data-testid="session-details-odometer">
+						<th class="align-middle">
+							{{ $t("session.odometer") }}
+						</th>
+						<td>
+							<div class="odometer-cell d-flex align-items-center">
+								<div
+									v-if="editingOdometer"
+									class="input-group input-group-sm odometer-input w-auto"
+								>
+									<input
+										ref="odometerInput"
+										v-model="odometerInput"
+										type="number"
+										inputmode="numeric"
+										min="0"
+										class="form-control grow-0 text-end"
+										:aria-label="$t('session.odometer')"
+										aria-describedby="sessionDetailsOdometerUnit"
+										@blur="saveOdometer"
+										@keydown.enter.prevent="saveOdometer"
+										@keydown.esc.stop="cancelOdometer"
+									/>
+									<span id="sessionDetailsOdometerUnit" class="input-group-text">
+										{{ distanceUnitLabel }}
+									</span>
+								</div>
+								<button
+									v-else
+									type="button"
+									class="btn-reset text-decoration-underline"
+									:class="{ 'text-muted': !session.odometer }"
+									:aria-label="$t('session.odometer')"
+									@click="startEditOdometer"
+								>
+									{{
+										session.odometer
+											? formatKm(session.odometer)
+											: $t("session.addOdometer")
+									}}
+								</button>
+							</div>
+						</td>
+					</tr>
+					<tr v-if="session.meterStart" data-testid="session-details-meter">
+						<th class="align-baseline">
+							{{ $t("session.meter") }}
+						</th>
+						<td>
+							{{ fmtWh(session.meterStart * 1e3) }}<br />
+							{{ fmtWh(session.meterStop * 1e3) }}
+						</td>
+					</tr>
+				</tbody>
+			</table>
+
+			<div class="d-flex justify-content-start">
+				<button
+					type="button"
+					class="btn btn-link text-danger"
+					data-testid="session-details-delete"
+					@click="openRemoveConfirmationModal"
+				>
+					{{ $t("session.delete") }}
+				</button>
+			</div>
+		</div>
+	</GenericModal>
+
+	<GenericModal
+		id="deleteSessionConfirmationModal"
+		ref="confirmModal"
+		:title="$t('sessions.reallyDelete')"
+		data-testid="session-details-confirm"
+	>
+		<div v-if="session" class="d-flex justify-content-between">
+			<button
+				type="button"
+				class="btn btn-outline-secondary"
+				@click="openSessionDetailsModal"
+			>
+				{{ $t("session.cancel") }}
+			</button>
+			<button type="button" class="btn btn-danger" @click="removeSession">
+				{{ $t("session.delete") }}
+			</button>
+		</div>
+	</GenericModal>
+</template>
+
+<script lang="ts">
+import "@h2d2/shopicons/es/regular/checkmark";
+import formatter from "@/mixins/formatter";
+import Options from "../Vehicles/Options.vue";
+import CustomSelect from "../Helper/CustomSelect.vue";
+import GenericModal from "../Helper/GenericModal.vue";
+import { distanceUnit, distanceValue, distanceValueReverse } from "@/units";
+import api from "@/api";
+import { defineComponent, type PropType } from "vue";
+import type { Session } from "./types";
+import type { CURRENCY, SelectOption, Vehicle } from "@/types/evcc";
+
+export default defineComponent({
+	name: "SessionDetailsModal",
+	components: { VehicleOptions: Options, CustomSelect, GenericModal },
+	mixins: [formatter],
+	props: {
+		session: { type: Object as PropType<Session>, default: () => ({}) },
+		currency: { type: String as PropType<CURRENCY> },
+		vehicles: { type: Array as PropType<Vehicle[]>, default: () => [] },
+		loadpoints: { type: Array as PropType<string[]>, default: () => [] },
+	},
+	emits: ["session-changed"],
+	data() {
+		return {
+			editingOdometer: false,
+			odometerInput: "" as number | string,
+			odometerOriginal: "" as number | string,
+		};
+	},
+	computed: {
+		distanceUnitLabel(): string {
+			return distanceUnit();
+		},
+		chargedEnergy() {
+			return this.session.chargedEnergy * 1e3;
+		},
+		totalCo2Formatted(): string {
+			const grams = (this.session.co2PerKWh ?? 0) * (this.session.chargedEnergy ?? 0);
+			return this.fmtGrams(grams);
+		},
+		avgPower() {
+			const hours = this.session.chargeDuration / 1e9 / 3600;
+			return this.chargedEnergy / hours;
+		},
+		solarEnergy() {
+			return this.chargedEnergy * (this.session.solarPercentage / 100);
+		},
+		socRange(): string {
+			const { socStart, socEnd } = this.session;
+			if (socStart == null || socEnd == null) {
+				return "";
+			}
+			const added = socEnd - socStart;
+			return `${this.fmtPercentage(added, 0, true)} (${this.fmtNumber(socStart, 0)} – ${this.fmtPercentage(socEnd, 0)})`;
+		},
+		vehicleOptions(): SelectOption<string>[] {
+			return this.vehicles.map((v) => ({
+				name: v.title,
+				value: v.title,
+			}));
+		},
+		loadpointOptions(): SelectOption<string>[] {
+			return this.loadpoints.map((loadpoint) => ({
+				value: loadpoint,
+				name: loadpoint,
+			}));
+		},
+	},
+	methods: {
+		openSessionDetailsModal() {
+			(this.$refs["confirmModal"] as any)?.close();
+			(this.$refs["modal"] as any)?.open();
+		},
+		openRemoveConfirmationModal() {
+			(this.$refs["modal"] as any)?.close();
+			(this.$refs["confirmModal"] as any)?.open();
+		},
+		formatKm(value: number) {
+			return `${this.fmtNumber(distanceValue(value), 0)} ${distanceUnit()}`;
+		},
+		startEditOdometer() {
+			this.odometerInput = this.session.odometer
+				? Math.round(distanceValue(this.session.odometer))
+				: "";
+			this.odometerOriginal = this.odometerInput;
+			this.editingOdometer = true;
+			this.$nextTick(() => (this.$refs["odometerInput"] as HTMLInputElement)?.focus());
+		},
+		cancelOdometer() {
+			this.editingOdometer = false;
+		},
+		async saveOdometer() {
+			if (!this.editingOdometer) return;
+			this.editingOdometer = false;
+			const value = this.odometerInput;
+			if (value === this.odometerOriginal) return;
+			// empty input clears the stored value
+			const odometer = value === "" ? null : distanceValueReverse(Number(value));
+			await this.updateSession({ odometer });
+		},
+		async changeVehicle(title: string) {
+			await this.updateSession({ vehicle: title });
+		},
+		async removeVehicle() {
+			await this.updateSession({ vehicle: "" });
+		},
+		async changeLoadpoint(title: string) {
+			await this.updateSession({ loadpoint: title });
+		},
+		async updateSession(
+			data: Partial<Session> | { vehicle: null } | { odometer: number | null }
+		) {
+			try {
+				await api.put("session/" + this.session.id, data);
+				this.$emit("session-changed");
+			} catch (err) {
+				console.error(err);
+			}
+		},
+		async removeSession() {
+			try {
+				await api.delete("session/" + this.session.id);
+				(this.$refs["confirmModal"] as any)?.close();
+				this.$emit("session-changed");
+			} catch (err) {
+				console.error(err);
+			}
+		},
+	},
+});
+</script>
+
+<style scoped>
+.options .vehicle-name {
+	text-decoration: underline;
+}
+
+.options .loadpoint-name {
+	text-decoration: underline;
+}
+
+.odometer-cell {
+	/* reserve edit-input height so the row doesn't jump between view/edit */
+	min-height: 2rem;
+}
+
+.odometer-input .form-control {
+	/* fit ~7 digits (e.g. 128222) */
+	width: calc(7ch + 1rem);
+	-moz-appearance: textfield;
+	appearance: textfield;
+}
+
+.odometer-input .form-control::-webkit-inner-spin-button,
+.odometer-input .form-control::-webkit-outer-spin-button {
+	-webkit-appearance: none;
+	appearance: none;
+	margin: 0;
+}
+</style>

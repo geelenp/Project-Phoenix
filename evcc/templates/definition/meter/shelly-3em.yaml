@@ -1,0 +1,69 @@
+template: shelly-3em
+products:
+  - brand: Shelly
+    description:
+      generic: 3EM (Gen.1)
+caveats:
+  - description:
+      de: Integrierter Zähler ohne Phasensaldierung; stattdessen Leistungsintegration.
+      en: Built-in meter lacks summative energy measurement; power is integrated instead.
+    link: https://github.com/evcc-io/evcc/issues/29727
+params:
+  - name: usage
+    choice: ["grid", "pv", "charge"]
+  - name: host
+  - name: user
+    advanced: true
+  - name: password
+    advanced: true
+render: |
+  {{- define "uri" -}}
+  http://{{ if .user }}{{ urlEncode .user }}:{{ urlEncode .password }}@{{ end }}{{ .host }}
+  {{- end }}
+  type: custom
+  power:
+    source: http
+    uri: {{ include "uri" . }}/status
+    jq: .emeters | map(.power) | add
+  {{- if ne .usage "grid" }}
+  energy:
+    source: http
+    uri: {{ include "uri" . }}/status
+    jq: .emeters | map(.total) | add
+    scale: 0.001
+  returnenergy:
+    source: http
+    uri: {{ include "uri" . }}/status
+    jq: .emeters | map(.total_returned) | add
+    scale: 0.001
+  {{- end }}
+  currents:
+  - source: http
+    uri: {{ include "uri" . }}/emeter/0
+    jq: .current
+  - source: http
+    uri: {{ include "uri" . }}/emeter/1
+    jq: .current
+  - source: http
+    uri: {{ include "uri" . }}/emeter/2
+    jq: .current
+  voltages:
+  - source: http
+    uri: {{ include "uri" . }}/emeter/0
+    jq: .voltage
+  - source: http
+    uri: {{ include "uri" . }}/emeter/1
+    jq: .voltage
+  - source: http
+    uri: {{ include "uri" . }}/emeter/2
+    jq: .voltage
+  powers:
+  - source: http
+    uri: {{ include "uri" . }}/emeter/0
+    jq: .power
+  - source: http
+    uri: {{ include "uri" . }}/emeter/1
+    jq: .power
+  - source: http
+    uri: {{ include "uri" . }}/emeter/2
+    jq: .power

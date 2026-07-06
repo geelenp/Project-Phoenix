@@ -1,0 +1,139 @@
+package server
+
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"reflect"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/evcc-io/evcc/core/keys"
+	"github.com/evcc-io/evcc/server/db/settings"
+	"github.com/evcc-io/evcc/util/auth"
+	"github.com/evcc-io/evcc/util/redact"
+	"github.com/gorilla/mux"
+	"go.yaml.in/yaml/v4"
+)
+
+func settingsGetStringHandler(key string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		res, _ := settings.String(key)
+
+		// Check if private data should be hidden
+		if r.URL.Query().Get("private") == "false" && res != "" {
+			res = redact.String(res)
+		}
+
+		jsonWrite(w, res)
+	}
+}
+
+func settingsDeleteHandler(key string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		settings.SetString(key, "")
+		jsonWrite(w, true)
+	}
+}
+
+func settingsSetDurationHandler(key string, pub publisher) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+
+		val, err := strconv.Atoi(vars["value"])
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err)
+			return
+		}
+
+		settings.SetInt(key, int64(time.Second*time.Duration(val)))
+		setConfigDirty()
+
+		pub(key, val)
+
+		jsonWrite(w, val)
+	}
+}
+
+func settingsSetYamlHandler(key string, other, struc any, authObject auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err)
+			return
+		}
+
+		if err := yaml.Unmarshal(b, &other); err != nil {
+			jsonError(w, http.StatusBadRequest, err)
+			return
+		}
+
+		if err := settings.DecodeOtherSliceOrMap(other, &struc); err != nil {
+			jsonError(w, http.StatusBadRequest, err)
+			return
+		}
+
+		// script plugins need the admin password
+		if !requireCriticalConfigAuth(w, r, authObject, configReq{Yaml: string(b)}) {
+			return
+		}
+
+		val := strings.TrimSpace(string(b))
+		settings.SetString(key, val)
+		setConfigDirty()
+
+		jsonWrite(w, val)
+	}
+}
+
+func allowPub(key string) bool {
+	// don't publish on update - would overwrite globalconfig.Info struct with config
+	// TODO come up with a general solution once all endpoinds use Info
+	return key != keys.EEBus
+}
+
+func settingsSetJsonHandler(key string, pub publisher, newStruc func() any) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		struc := newStruc()
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&struc); err != nil {
+			jsonError(w, http.StatusBadRequest, err)
+			return
+		}
+
+		oldStruc := newStruc()
+		if err := settings.Json(key, &oldStruc); err == nil {
+			// Skip merge for slices - they should be replaced entirely
+			if reflect.ValueOf(struc).Elem().Kind() != reflect.Slice {
+				if err := mergeMaskedAny(oldStruc, struc); err != nil {
+					jsonError(w, http.StatusInternalServerError, err)
+					return
+				}
+			}
+		}
+
+		settings.SetJson(key, struc)
+		setConfigDirty()
+
+		if allowPub(key) {
+			pub(key, struc)
+		}
+
+		jsonWrite(w, true)
+	}
+}
+
+func settingsDeleteJsonHandler(key string, pub publisher, struc any) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		settings.SetString(key, "")
+		setConfigDirty()
+
+		if allowPub(key) {
+			pub(key, struc)
+		}
+
+		jsonWrite(w, true)
+	}
+}

@@ -1,0 +1,122 @@
+package tariff
+
+import (
+	"fmt"
+	"sort"
+	"time"
+
+	"github.com/benbjohnson/clock"
+	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/tariff/fixed"
+	"github.com/evcc-io/evcc/util"
+	"github.com/jinzhu/now"
+)
+
+type Fixed struct {
+	*embed
+	clock   clock.Clock
+	zones   fixed.Zones
+	dynamic bool
+}
+
+var _ api.Tariff = (*Fixed)(nil)
+
+func init() {
+	registry.Add("fixed", NewFixedFromConfig)
+}
+
+func NewFixedFromConfig(other map[string]any) (api.Tariff, error) {
+	var cc struct {
+		embed `mapstructure:",squash"`
+		Price float64
+		Zones []fixed.ZoneSpec
+	}
+
+	if err := util.DecodeOther(other, &cc); err != nil {
+		return nil, err
+	}
+
+	if err := cc.embed.init(); err != nil {
+		return nil, err
+	}
+
+	zones, err := fixed.ParseZones(cc.Zones)
+	if err != nil {
+		return nil, err
+	}
+
+	t := &Fixed{
+		embed:   &cc.embed,
+		clock:   clock.New(),
+		dynamic: len(cc.Zones) >= 1 || len(cc.ChargesZones_) >= 1,
+		zones:   zones,
+	}
+
+	sort.Sort(t.zones)
+
+	// prepend catch-all zone
+	t.zones = append([]fixed.Zone{
+		{Price: cc.Price}, // full week is implicit
+	}, t.zones...)
+
+	return t, nil
+}
+
+// Rates implements the api.Tariff interface
+func (t *Fixed) Rates() (api.Rates, error) {
+	var res api.Rates
+
+	start := now.With(t.clock.Now().Local()).BeginningOfDay()
+	for i := range 7 {
+		dayStart := start.AddDate(0, 0, i)
+		dow := fixed.Day((int(start.Weekday()) + i) % 7)
+		month := fixed.Month(dayStart.Month() - 1)
+
+		zones := t.zones.ForDayAndMonth(dow, month)
+		if len(zones) == 0 {
+			return nil, fmt.Errorf("no zones for weekday %d", dow)
+		}
+
+		markers := zones.TimeTableMarkers()
+
+		for i, m := range markers {
+			ts := dayStart.Add(time.Minute * time.Duration(m.Minutes()))
+
+			var zone *fixed.Zone
+			for j := len(zones) - 1; j >= 0; j-- {
+				if zones[j].Hours.Contains(m) {
+					zone = &zones[j]
+					break
+				}
+			}
+
+			if zone == nil {
+				return nil, fmt.Errorf("could not find zone for %02d:%02d", m.Hour, m.Min)
+			}
+
+			// end rate at end of day or next marker
+			end := dayStart.AddDate(0, 0, 1)
+			if i+1 < len(markers) {
+				end = dayStart.Add(time.Minute * time.Duration(markers[i+1].Minutes()))
+			}
+
+			rate := api.Rate{
+				Start: ts,
+				End:   end,
+				Value: t.totalPrice(zone.Price, ts),
+			}
+
+			res = append(res, rate)
+		}
+	}
+
+	return res, nil
+}
+
+// Type implements the api.Tariff interface
+func (t *Fixed) Type() api.TariffType {
+	if t.dynamic {
+		return api.TariffTypePriceForecast
+	}
+	return api.TariffTypePriceStatic
+}

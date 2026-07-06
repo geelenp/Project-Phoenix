@@ -1,0 +1,48 @@
+package cmd
+
+import (
+	"github.com/AlecAivazis/survey/v2"
+	"github.com/evcc-io/evcc/util/auth"
+	"github.com/spf13/cobra"
+)
+
+var passwordSetCmd = &cobra.Command{
+	Use:   "set",
+	Short: "Set password",
+	Args:  cobra.ExactArgs(0),
+	Run:   runPasswordSet,
+}
+
+func init() {
+	passwordCmd.AddCommand(passwordSetCmd)
+}
+
+func runPasswordSet(cmd *cobra.Command, args []string) {
+	// load config
+	if err := loadConfigFile(&conf, !cmd.Flag(flagIgnoreDatabase).Changed); err != nil {
+		log.FATAL.Fatal(err)
+	}
+
+	// setup persistence
+	if err := configureDatabase(conf.Database); err != nil {
+		fatalDatabase(err)
+	}
+
+	prompt := &survey.Password{
+		Message: "Password",
+		Help:    "help",
+	}
+
+	var password string
+	if err := survey.AskOne(prompt, &password); err != nil {
+		log.FATAL.Fatal(err)
+	}
+
+	if password == "" {
+		log.FATAL.Fatal("password cannot be empty")
+	} else if err := auth.New().SetAdminPassword(password); err != nil {
+		log.FATAL.Fatal(err)
+	} else {
+		persistPasswordSettings()
+	}
+}

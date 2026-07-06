@@ -1,0 +1,20 @@
+template: fronius-wattpilot
+deprecated: true
+products:
+  - brand: Fronius
+    description:
+      generic: Wattpilot
+capabilities: ["rfid", "1p3p", "meter", "dim"]
+requirements:
+  description:
+    de: |
+      Benötigt mindestens Firmware 36.3 oder neuer.
+    en: |
+      Requires firmware 36.3 or later.
+params:
+  - name: host
+  - name: password
+render: |
+  type: wattpilot
+  uri: {{ .host }}
+  password: {{ .password }}

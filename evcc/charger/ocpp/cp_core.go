@@ -1,0 +1,113 @@
+package ocpp
+
+import (
+	"errors"
+
+	"github.com/lorenzodonini/ocpp-go/ocpp1.6/core"
+	"github.com/lorenzodonini/ocpp-go/ocpp1.6/types"
+)
+
+var (
+	ErrInvalidRequest     = errors.New("invalid request")
+	ErrInvalidConnector   = errors.New("invalid connector")
+	ErrInvalidTransaction = errors.New("invalid transaction")
+)
+
+func (cp *CP) OnBootNotification(request *core.BootNotificationRequest) (*core.BootNotificationConfirmation, error) {
+	res := &core.BootNotificationConfirmation{
+		CurrentTime: types.Now(),
+		Interval:    60,
+		Status:      core.RegistrationStatusAccepted,
+	}
+
+	cp.mu.Lock()
+	cp.BootNotificationResult = request
+	cp.stopBootTimer()
+	cp.mu.Unlock()
+
+	// mark charge point as ready for communication
+	cp.connect(true)
+
+	// Notify the reboot monitor (and the initial Setup). The channel is
+	// buffered (size 1) and coalescing: if an older notification is still
+	// queued, drop it so the consumer always re-initializes against the most
+	// recent BootNotification. This matters when a charge point reboot-loops
+	// (e.g. issue #30113) faster than the monitor consumes notifications, or
+	// before the monitor has started at all - the channel must never overflow.
+	select {
+	case <-cp.bootNotificationRequestC:
+	default:
+	}
+	select {
+	case cp.bootNotificationRequestC <- request:
+	default:
+	}
+
+	return res, nil
+}
+
+func (cp *CP) OnStatusNotification(request *core.StatusNotificationRequest) (*core.StatusNotificationConfirmation, error) {
+	if request == nil {
+		return nil, ErrInvalidRequest
+	}
+
+	if conn := cp.connectorByID(request.ConnectorId); conn != nil {
+		return conn.OnStatusNotification(request)
+	}
+
+	return new(core.StatusNotificationConfirmation), nil
+}
+
+func (cp *CP) OnMeterValues(request *core.MeterValuesRequest) (*core.MeterValuesConfirmation, error) {
+	if request == nil {
+		return nil, ErrInvalidRequest
+	}
+
+	// signal received
+	select {
+	case cp.meterC <- struct{}{}:
+	default:
+	}
+
+	if conn := cp.connectorByID(request.ConnectorId); conn != nil {
+		conn.OnMeterValues(request)
+	}
+
+	return new(core.MeterValuesConfirmation), nil
+}
+
+func (cp *CP) OnStartTransaction(request *core.StartTransactionRequest) (*core.StartTransactionConfirmation, error) {
+	if request == nil {
+		return nil, ErrInvalidRequest
+	}
+
+	if conn := cp.connectorByID(request.ConnectorId); conn != nil {
+		return conn.OnStartTransaction(request)
+	}
+
+	res := &core.StartTransactionConfirmation{
+		IdTagInfo: &types.IdTagInfo{
+			Status: types.AuthorizationStatusAccepted,
+		},
+	}
+
+	return res, nil
+}
+
+func (cp *CP) OnStopTransaction(request *core.StopTransactionRequest) (*core.StopTransactionConfirmation, error) {
+	if request == nil {
+		return nil, ErrInvalidRequest
+	}
+
+	if conn := cp.connectorByTransactionID(request.TransactionId); conn != nil {
+		return conn.OnStopTransaction(request)
+	}
+
+	res := &core.StopTransactionConfirmation{
+		IdTagInfo: &types.IdTagInfo{
+			Status: types.AuthorizationStatusAccepted, // accept old pending stop message during startup
+		},
+	}
+
+	return res, nil
+}

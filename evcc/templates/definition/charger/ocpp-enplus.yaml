@@ -1,0 +1,13 @@
+template: ocpp-enplus
+products:
+  - brand: EN+
+    description:
+      generic: AC EV Charger
+capabilities: ["rfid", "dim"]
+requirements:
+  evcc: ["sponsorship", "skiptest"]
+params:
+  - preset: ocpp
+render: |
+  {{ include "ocpp" . }}
+  nochangeavailability: true

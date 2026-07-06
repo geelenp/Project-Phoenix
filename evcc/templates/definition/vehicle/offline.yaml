@@ -1,0 +1,25 @@
+template: offline
+products:
+  - description:
+      en: Generic vehicle (without API)
+      de: Generisches Fahrzeug (ohne API)
+requirements:
+  description:
+    de:
+group: generic
+params:
+  - preset: vehicle-common
+  - name: coarsecurrent
+    advanced: true
+  - name: welcomecharge
+  - name: climaterdisabled
+    deprecated: true
+  - name: autodetectdisabled
+    deprecated: true
+render: |
+  type: custom
+  {{- include "vehicle-common" . }}
+  {{ include "vehicle-features" (merge (dict "basefeatures" (list "offline")) .) }}
+  soc:
+    source: const
+    value: 0

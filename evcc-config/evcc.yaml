@@ -1,0 +1,32 @@
+ite:
+  title: Project Phoenix
+
+  meters:
+    grid: grid_youless
+
+log: debug
+
+meters:
+  # Grid
+  - name: grid_youless
+    type: template
+    template: youless
+    usage: grid
+    host: 192.168.0.218
+
+  # PV
+  - name: pv
+    type: template
+    template: eastron-sdm120
+    usage: pv
+
+    device: /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG01X9OK-if00-port0
+    baudrate: 9600
+    comset: "8N1"
+    id: 1
+
+chargers:
+
+vehicles:
+
+loadpoints:

@@ -1,0 +1,1478 @@
+package cmd
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	paho "github.com/eclipse/paho.mqtt.golang"
+	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/api/globalconfig"
+	"github.com/evcc-io/evcc/charger"
+	"github.com/evcc-io/evcc/charger/ocpp"
+	"github.com/evcc-io/evcc/cmd/shutdown"
+	"github.com/evcc-io/evcc/core"
+	"github.com/evcc-io/evcc/core/circuit"
+	"github.com/evcc-io/evcc/core/keys"
+	"github.com/evcc-io/evcc/core/loadpoint"
+	"github.com/evcc-io/evcc/core/metrics"
+	coresettings "github.com/evcc-io/evcc/core/settings"
+	"github.com/evcc-io/evcc/hems"
+	hemsapi "github.com/evcc-io/evcc/hems/hems"
+	"github.com/evcc-io/evcc/hems/shm"
+	"github.com/evcc-io/evcc/messenger"
+	"github.com/evcc-io/evcc/meter"
+	"github.com/evcc-io/evcc/plugin/golang"
+	"github.com/evcc-io/evcc/plugin/javascript"
+	"github.com/evcc-io/evcc/plugin/mqtt"
+	"github.com/evcc-io/evcc/server"
+	"github.com/evcc-io/evcc/server/db"
+	"github.com/evcc-io/evcc/server/db/settings"
+	"github.com/evcc-io/evcc/server/eebus"
+	"github.com/evcc-io/evcc/server/modbus"
+	"github.com/evcc-io/evcc/server/providerauth"
+	"github.com/evcc-io/evcc/tariff"
+	"github.com/evcc-io/evcc/util"
+	"github.com/evcc-io/evcc/util/config"
+	"github.com/evcc-io/evcc/util/locale"
+	"github.com/evcc-io/evcc/util/machine"
+	"github.com/evcc-io/evcc/util/request"
+	_ "github.com/evcc-io/evcc/util/service"
+	"github.com/evcc-io/evcc/util/sponsor"
+	"github.com/evcc-io/evcc/util/templates"
+	"github.com/evcc-io/evcc/vehicle"
+	"github.com/gorilla/handlers"
+	"github.com/gorilla/mux"
+	"github.com/libp2p/zeroconf/v2"
+	"github.com/samber/lo"
+	"github.com/spf13/cast"
+	"github.com/spf13/cobra"
+	vpr "github.com/spf13/viper"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/text/currency"
+)
+
+var conf = globalconfig.All{
+	Interval: 30 * time.Second,
+	Log:      "info",
+	Network: globalconfig.Network{
+		Host: "",
+		Port: 7070,
+	},
+	Ocpp: ocpp.Config{
+		Port: 8887,
+	},
+	Mqtt: globalconfig.Mqtt{
+		Topic: "evcc",
+	},
+	EEBus: eebus.Config{
+		Port: 4712,
+	},
+	Database: globalconfig.DB{
+		Type: "sqlite",
+		Dsn:  "",
+	},
+}
+
+var yamlSource struct {
+	sponsor   globalconfig.YamlSource
+	hems      globalconfig.YamlSource
+	eebus     globalconfig.YamlSource
+	tariffs   globalconfig.YamlSource
+	messaging globalconfig.YamlSource
+	circuits  globalconfig.YamlSource
+}
+
+var nameRE = regexp.MustCompile(`^[a-zA-Z0-9_.:-]+$`)
+
+func nameValid(name string) error {
+	if !nameRE.MatchString(name) {
+		return fmt.Errorf("name must not contain special characters or spaces: %s", name)
+	}
+	return nil
+}
+
+func loadConfigFile(conf *globalconfig.All, checkDB bool) error {
+	if err := viper.ReadInConfig(); err != nil {
+		if _, ok := errors.AsType[vpr.ConfigFileNotFoundError](err); !ok {
+			return fmt.Errorf("failed reading config file: %w", err)
+		}
+	}
+
+	if cfgFile := viper.ConfigFileUsed(); cfgFile != "" {
+		log.INFO.Println("using config file:", cfgFile)
+	} else {
+		log.INFO.Println("config file not found, database-only mode")
+	}
+
+	if err := viper.UnmarshalExact(conf); err != nil {
+		return fmt.Errorf("failed parsing config file: %w", err)
+	}
+
+	// user did not specify a database path
+	if conf.Database.Dsn == "" && checkDB {
+		// check if service database exists
+		if _, err := os.Stat(serviceDB); err == nil {
+			// service database found, ask user what to do
+			sudo := ""
+			if !isWritable(serviceDB) {
+				sudo = "sudo "
+			}
+			log.FATAL.Fatal(`
+Found systemd service database at "` + serviceDB + `", evcc has been invoked with no explicit database path.
+Running the same config with multiple databases can lead to expiring vehicle tokens.
+
+If you want to use the existing service database run the following command:
+
+` + sudo + `evcc --database ` + serviceDB + `
+
+If you want to create a new user-space database run the following command:
+
+evcc --database ~/.evcc/evcc.db
+
+If you know what you're doing, you can skip the database check with the --ignore-db flag.
+			`)
+		}
+	}
+
+	// parse log levels after reading config
+	parseLogLevels()
+
+	return nil
+}
+
+func isWritable(filePath string) bool {
+	file, err := os.OpenFile(filePath, os.O_WRONLY, 0o666)
+	if err != nil {
+		return false
+	}
+	file.Close()
+	return true
+}
+
+func configureCircuits(conf *[]config.Named) error {
+	// yaml config from file
+	if len(*conf) != 0 {
+		yamlSource.circuits = globalconfig.YamlSourceFile
+	}
+
+	// yaml config from db (deprecated)
+	if settings.Exists(keys.Circuits) {
+		if yamlSource.circuits == globalconfig.YamlSourceFile {
+			// just warn, no error to not break previous behavior
+			log.WARN.Println("circuits configured via UI yaml; evcc.yaml config will be ignored")
+		}
+		*conf = []config.Named{}
+		if err := settings.Yaml(keys.Circuits, new([]map[string]any), &conf); err != nil {
+			return err
+		}
+		yamlSource.circuits = globalconfig.YamlSourceDb
+	}
+
+	// load configCircuits devices from database
+	configurable, err := config.ConfigurationsByClass(templates.Circuit)
+	if err != nil {
+		return err
+	}
+
+	// device config from db
+	if yamlSource.circuits != globalconfig.YamlSourceNone && len(configurable) > 0 {
+		return errors.New("circuits are configured via UI; having an additional yaml config is not allowed")
+	}
+
+	if err := validateStaticCircuits(slices.Clone(*conf)); err != nil {
+		return err
+	}
+	if err := validateConfigurableCircuits(configurable); err != nil {
+		return err
+	}
+
+	for _, c := range configurable {
+		*conf = append(*conf, c.Named())
+	}
+
+	return nil
+}
+
+// validateCircuitConfigs validates circuit configurations with support for both static and configurable types
+func validateCircuitConfigs[T any](children []T, getConfigAndLogger func(T) (config.Named, *util.Logger), getDevice func(T, api.Circuit) config.Device[api.Circuit]) error {
+	// TODO check for circular references
+NEXT:
+	for i, child := range children {
+		cc, log := getConfigAndLogger(child)
+
+		if cc.Name == "" {
+			return fmt.Errorf("cannot create circuit: missing name")
+		}
+
+		if err := nameValid(cc.Name); err != nil {
+			return fmt.Errorf("cannot create circuit: duplicate name: %s", cc.Name)
+		}
+
+		if parent := cast.ToString(cc.Property("parent")); parent != "" {
+			if _, err := config.Circuits().ByName(parent); err != nil {
+				continue
+			}
+		}
+
+		typ, other, err := config.CustomDevice(cc.Type, cc.Other)
+		if err != nil {
+			return fmt.Errorf("cannot decode custom circuit '%s': %w", cc.Name, err)
+		}
+
+		ctx := util.WithLogger(context.TODO(), log)
+
+		instance, err := circuit.NewFromConfig(ctx, typ, other)
+		if err != nil {
+			return fmt.Errorf("cannot create circuit '%s': %w", cc.Name, err)
+		}
+
+		// ensure config has title
+		if instance.GetTitle() == "" {
+			//lint:ignore SA1019 as Title is safe on ascii
+			instance.SetTitle(strings.Title(cc.Name))
+		}
+
+		if err := config.Circuits().Add(getDevice(child, instance)); err != nil {
+			return err
+		}
+
+		children = slices.Delete(children, i, i+1)
+		goto NEXT
+	}
+
+	if len(children) > 0 {
+		cn, _ := getConfigAndLogger(children[0])
+		return fmt.Errorf("circuit is missing parent: %s", cn.Name)
+	}
+
+	var rootFound bool
+	for _, dev := range config.Circuits().Devices() {
+		c := dev.Instance()
+
+		if c.GetParent() == nil {
+			if rootFound {
+				return errors.New("cannot have multiple root circuits")
+			}
+			rootFound = true
+		}
+	}
+
+	if !rootFound && len(config.Circuits().Devices()) > 0 {
+		return errors.New("root circuit required")
+	}
+
+	return nil
+}
+
+func validateStaticCircuits(children []config.Named) error {
+	return validateCircuitConfigs(
+		children,
+		func(cc config.Named) (config.Named, *util.Logger) { return cc, util.NewLogger(cc.Name) },
+		func(cc config.Named, instance api.Circuit) config.Device[api.Circuit] {
+			return config.NewStaticDevice(cc, instance)
+		},
+	)
+}
+
+func validateConfigurableCircuits(children []config.Config) error {
+	return validateCircuitConfigs(
+		children,
+		func(cc config.Config) (config.Named, *util.Logger) { return cc.Named(), loggerForConfig(&cc) },
+		func(cc config.Config, instance api.Circuit) config.Device[api.Circuit] {
+			return config.NewConfigurableDevice(&cc, instance)
+		},
+	)
+}
+
+type newFromConfFunc[T any] func(context.Context, string, map[string]any) (T, error)
+
+func staticInstance[T any](typ string, cc config.Named, newFromConf newFromConfFunc[T], h config.Handler[T]) error {
+	ctx, cancel := context.WithCancel(util.WithLogger(context.TODO(), util.NewLogger(cc.Name)))
+
+	instance, err := newFromConf(ctx, cc.Type, cc.Other)
+	if err != nil {
+		err = &DeviceError{cc.Name, fmt.Errorf("cannot create %s '%s': %w", typ, cc.Name, err)}
+	}
+
+	// ctx lives for the device lifetime- only release it on failure
+	defer func() {
+		if err != nil {
+			cancel()
+		}
+	}()
+
+	if e := h.Add(config.NewStaticDevice(cc, instance)); e != nil && err == nil {
+		err = &DeviceError{cc.Name, e}
+	}
+
+	return err
+}
+
+// loggerForConfig creates a logger with sensible name for (custom) configurable device
+func loggerForConfig(conf *config.Config) *util.Logger {
+	res := conf.Named().Name
+	if t := conf.Title; t != "" && t != res {
+		res += "-" + t
+	}
+	return util.NewLogger(res)
+}
+
+func configurableInstance[T any](typ string, conf *config.Config, newFromConf newFromConfFunc[T], h config.Handler[T]) error {
+	cc := conf.Named()
+	ctx, cancel := context.WithCancel(util.WithLogger(context.TODO(), loggerForConfig(conf)))
+
+	typ, other, err := config.CustomDevice(cc.Type, cc.Other)
+	if err != nil {
+		err = &DeviceError{cc.Name, fmt.Errorf("cannot decode custom %s '%s': %w", typ, cc.Name, err)}
+	}
+
+	// ctx lives for the device lifetime- only release it on failure
+	defer func() {
+		if err != nil {
+			cancel()
+		}
+	}()
+
+	var instance T
+	if err == nil {
+		instance, err = newFromConf(ctx, typ, other)
+		if err != nil {
+			err = &DeviceError{cc.Name, fmt.Errorf("cannot create %s '%s': %w", typ, cc.Name, err)}
+		}
+	}
+
+	if e := h.Add(config.NewConfigurableDevice(conf, instance)); e != nil && err == nil {
+		err = &DeviceError{cc.Name, e}
+	}
+
+	return err
+}
+
+func configureMeters(static []config.Named, names ...string) error {
+	var eg errgroup.Group
+
+	for i, cc := range static {
+		if cc.Name == "" {
+			return fmt.Errorf("cannot create meter %d: missing name", i+1)
+		}
+
+		// configure all, if no name refs are given
+		if len(names) > 0 && !slices.Contains(names, cc.Name) {
+			continue
+		}
+
+		if err := nameValid(cc.Name); err != nil {
+			log.WARN.Printf("create meter %d: %v", i+1, err)
+		}
+
+		eg.Go(func() error {
+			return staticInstance("meter", cc, meter.NewFromConfig, config.Meters())
+		})
+	}
+
+	// append devices from database
+	configurable, err := config.ConfigurationsByClass(templates.Meter)
+	if err != nil {
+		return err
+	}
+
+	for _, conf := range configurable {
+		eg.Go(func() error {
+			cc := conf.Named()
+
+			// always skip unreferenced db devices
+			if !slices.Contains(names, cc.Name) {
+				return nil
+			}
+
+			return configurableInstance("meter", &conf, meter.NewFromConfig, config.Meters())
+		})
+	}
+
+	return eg.Wait()
+}
+
+func configureChargers(static []config.Named, names ...string) error {
+	var eg errgroup.Group
+
+	for i, cc := range static {
+		if cc.Name == "" {
+			return fmt.Errorf("cannot create charger %d: missing name", i+1)
+		}
+
+		// configure all, if no name refs are given
+		if len(names) > 0 && !slices.Contains(names, cc.Name) {
+			continue
+		}
+
+		if err := nameValid(cc.Name); err != nil {
+			log.WARN.Printf("create charger %d: %v", i+1, err)
+		}
+
+		eg.Go(func() error {
+			return staticInstance("charger", cc, charger.NewFromConfig, config.Chargers())
+		})
+	}
+
+	// append devices from database
+	configurable, err := config.ConfigurationsByClass(templates.Charger)
+	if err != nil {
+		return err
+	}
+
+	for _, conf := range configurable {
+		eg.Go(func() error {
+			cc := conf.Named()
+
+			// always skip unreferenced db devices
+			if !slices.Contains(names, cc.Name) {
+				return nil
+			}
+
+			return configurableInstance("charger", &conf, charger.NewFromConfig, config.Chargers())
+		})
+	}
+
+	return eg.Wait()
+}
+
+func vehicleInstance(cc config.Named) (api.Vehicle, error) {
+	ctx := util.WithLogger(context.TODO(), util.NewLogger(cc.Name))
+
+	typ, other, err := config.CustomDevice(cc.Type, cc.Other)
+
+	var instance api.Vehicle
+	if err == nil {
+		instance, err = vehicle.NewFromConfig(ctx, typ, other)
+	}
+
+	if err != nil {
+		if _, ok := errors.AsType[*util.ConfigError](err); ok {
+			return nil, err
+		}
+
+		// wrap non-config vehicle errors to prevent fatals
+		log.ERROR.Printf("creating vehicle %s failed: %v", cc.Name, err)
+		instance = vehicle.NewWrapper(cc.Name, cc.Type, cc.Other, err)
+	}
+
+	// ensure vehicle config has title
+	if instance.GetTitle() == "" {
+		//lint:ignore SA1019 as Title is safe on ascii
+		instance.SetTitle(strings.Title(cc.Name))
+	}
+
+	return instance, nil
+}
+
+func configureVehicles(static []config.Named, names ...string) error {
+	var mu sync.Mutex
+	var eg errgroup.Group
+
+	// stable-sort vehicles by name
+	devs1 := make([]config.Device[api.Vehicle], 0, len(static))
+
+	for i, cc := range static {
+		if cc.Name == "" {
+			return fmt.Errorf("cannot create vehicle %d: missing name", i+1)
+		}
+
+		if len(names) > 0 && !slices.Contains(names, cc.Name) {
+			continue
+		}
+
+		if err := nameValid(cc.Name); err != nil {
+			return fmt.Errorf("cannot create vehicle %d: %w", i+1, err)
+		}
+
+		eg.Go(func() error {
+			instance, err := vehicleInstance(cc)
+			if err != nil {
+				return fmt.Errorf("cannot create vehicle '%s': %w", cc.Name, err)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			devs1 = append(devs1, config.NewStaticDevice(cc, instance))
+
+			return nil
+		})
+	}
+
+	// append devices from database
+	configurable, err := config.ConfigurationsByClass(templates.Vehicle)
+	if err != nil {
+		return err
+	}
+
+	// stable-sort vehicles by id
+	devs2 := make([]config.ConfigurableDevice[api.Vehicle], 0, len(configurable))
+
+	for _, conf := range configurable {
+		eg.Go(func() error {
+			cc := conf.Named()
+
+			if len(names) > 0 && !slices.Contains(names, cc.Name) {
+				return nil
+			}
+
+			instance, err := vehicleInstance(cc)
+			if err != nil {
+				return fmt.Errorf("cannot create vehicle '%s': %w", cc.Name, err)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			devs2 = append(devs2, config.NewConfigurableDevice(&conf, instance))
+
+			return nil
+		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		return err
+	}
+
+	slices.SortFunc(devs1, func(i, j config.Device[api.Vehicle]) int {
+		return cmp.Compare(strings.ToLower(i.Config().Name), strings.ToLower(j.Config().Name))
+	})
+
+	for _, dev := range devs1 {
+		if err := config.Vehicles().Add(dev); err != nil {
+			return err
+		}
+	}
+
+	slices.SortFunc(devs2, func(i, j config.ConfigurableDevice[api.Vehicle]) int {
+		return cmp.Compare(i.ID(), j.ID())
+	})
+
+	for _, dev := range devs2 {
+		if err := config.Vehicles().Add(dev); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func configureSponsorship(token string) (err error) {
+	if settings.Exists(keys.SponsorToken) {
+		if token, err = settings.String(keys.SponsorToken); err != nil {
+			return err
+		}
+	} else if token != "" {
+		yamlSource.sponsor = globalconfig.YamlSourceFile
+	}
+
+	return sponsor.ConfigureSponsorship(token)
+}
+
+func configureEnvironment(cmd *cobra.Command, conf *globalconfig.All) error {
+	// full http request log
+	if cmd.Flag(flagHeaders).Changed {
+		request.LogHeaders = true
+	}
+
+	// setup persistence
+	err := wrapErrorWithClass(ClassDatabase, configureDatabase(conf.Database))
+
+	// configure network
+	if err == nil {
+		err = networkSettings(&conf.Network)
+	}
+
+	// setup additional templates
+	if err == nil {
+		if cmd.Flags().Changed(flagTemplate) {
+			class, err := templates.ClassString(cmd.Flags().Lookup(flagTemplateType).Value.String())
+			if err != nil {
+				return err
+			}
+
+			if err := templates.Register(class, cmd.Flag(flagTemplate).Value.String()); err != nil {
+				return err
+			}
+		}
+	}
+
+	// setup translations
+	if err == nil {
+		// TODO decide wrapping
+		err = locale.Init()
+	}
+
+	// setup machine id
+	if err == nil && conf.Plant != "" {
+		// TODO decide wrapping
+		err = machine.CustomID(conf.Plant)
+	}
+
+	// setup sponsorship (allow env override)
+	if err == nil {
+		err = wrapErrorWithClass(ClassSponsorship, configureSponsorship(conf.SponsorToken))
+	}
+
+	// setup mqtt client listener
+	if err == nil {
+		err = wrapErrorWithClass(ClassMqtt, configureMqtt(&conf.Mqtt))
+	}
+
+	// setup OCPP server
+	if err == nil {
+		configureOCPP(&conf.Ocpp, conf.Network.ExternalUrl)
+	}
+
+	// setup EEBus server
+	if err == nil {
+		err = wrapErrorWithClass(ClassEEBus, configureEEBus(&conf.EEBus))
+	}
+
+	// setup javascript VMs
+	if err == nil {
+		err = wrapErrorWithClass(ClassJavascript, configureJavascript(conf.Javascript))
+	}
+
+	// setup go VMs
+	if err == nil {
+		err = wrapErrorWithClass(ClassGo, configureGo(conf.Go))
+	}
+
+	return err
+}
+
+// configureDatabase configures session database
+func configureDatabase(conf globalconfig.DB) error {
+	if conf.Dsn == "" {
+		conf.Dsn = userDB
+	}
+
+	if err := db.NewInstance(conf.Type, conf.Dsn); err != nil {
+		return err
+	}
+
+	persistSettings := func() {
+		if err := settings.Persist(); err != nil {
+			log.ERROR.Println("cannot save settings:", err)
+		}
+	}
+
+	// persist unsaved settings on shutdown
+	shutdown.Register(persistSettings)
+
+	// persist unsaved settings every 30 minutes
+	go func() {
+		for range time.Tick(time.Minute) {
+			persistSettings()
+		}
+	}()
+
+	return nil
+}
+
+// configureInflux configures influx database
+func configureInflux(conf *globalconfig.Influx) (*server.Influx, error) {
+	// read settings
+	if settings.Exists(keys.Influx) {
+		if err := settings.Json(keys.Influx, &conf); err != nil {
+			return nil, err
+		}
+	}
+
+	if conf.URL == "" {
+		return nil, nil
+	}
+
+	influx := server.NewInfluxClient(
+		conf.URL,
+		conf.Token,
+		conf.Org,
+		conf.User,
+		conf.Password,
+		conf.Database,
+		conf.Insecure,
+	)
+
+	return influx, nil
+}
+
+// setup mqtt
+func configureMqtt(conf *globalconfig.Mqtt) error {
+	// migrate settings
+	if settings.Exists(keys.Mqtt) {
+		if err := settings.Json(keys.Mqtt, &conf); err != nil {
+			return err
+		}
+	}
+
+	if conf.Broker == "" {
+		return nil
+	}
+
+	log := util.NewLogger("mqtt")
+
+	instance, err := mqtt.RegisteredClient(log, conf.Broker, conf.User, conf.Password, conf.ClientID, 1, conf.Insecure, conf.CaCert, conf.ClientCert, conf.ClientKey, func(options *paho.ClientOptions) {
+		if !runAsService || conf.Topic == "" {
+			return
+		}
+
+		topic := fmt.Sprintf("%s/status", strings.Trim(conf.Topic, "/"))
+		options.SetWill(topic, "offline", 1, true)
+
+		oc := options.OnConnect
+		options.SetOnConnectHandler(func(client paho.Client) {
+			oc(client)                                   // original handler
+			_ = client.Publish(topic, 1, true, "online") // alive - not logged
+		})
+	})
+	if err != nil {
+		return fmt.Errorf("failed configuring mqtt: %w", err)
+	}
+
+	mqtt.Instance = instance
+	return nil
+}
+
+// setup SHM
+func configureSHM(conf *shm.Config, externalUrl string, site *core.Site, httpd *server.HTTPd) error {
+	if settings.Exists(keys.Shm) {
+		if err := settings.Json(keys.Shm, &conf); err != nil {
+			return err
+		}
+	}
+
+	if err := shm.NewFromConfig(*conf, externalUrl, site, httpd.Addr, httpd.Router()); err != nil {
+		return fmt.Errorf("failed configuring shm: %w", err)
+	}
+
+	return nil
+}
+
+// setup javascript
+func configureJavascript(conf []globalconfig.Javascript) error {
+	for _, cc := range conf {
+		if _, err := javascript.RegisteredVM(cc.VM, cc.Script); err != nil {
+			return fmt.Errorf("failed configuring javascript: %w", err)
+		}
+	}
+	return nil
+}
+
+// setup go
+func configureGo(conf []globalconfig.Go) error {
+	for _, cc := range conf {
+		if _, err := golang.RegisteredVM(cc.VM, cc.Script); err != nil {
+			return fmt.Errorf("failed configuring go: %w", err)
+		}
+	}
+	return nil
+}
+
+// setup HEMS
+func configureHEMS(conf *globalconfig.Hems, site *core.Site) (hemsapi.API, error) {
+	if conf.Type != "" {
+		yamlSource.hems = globalconfig.YamlSourceFile
+
+		typ, other, err := config.CustomDevice(conf.Type, conf.Other)
+		if err != nil {
+			return nil, fmt.Errorf("cannot decode custom hems '%s': %w", conf.Type, err)
+		}
+
+		instance, err := hems.NewFromConfig(context.TODO(), typ, other, site)
+		if err != nil {
+			return nil, fmt.Errorf("failed configuring hems: %w", err)
+		}
+
+		site.SetHEMS(instance)
+
+		go instance.Run()
+
+		return instance, nil
+	}
+
+	// migrate legacy keys.Hems setting (pre-UI) to a device-managed custom entry
+	if err := migrateLegacyHemsSetting(); err != nil {
+		return nil, fmt.Errorf("migrating legacy hems setting: %w", err)
+	}
+
+	return configureDbHems(site)
+}
+
+// migrateLegacyHemsSetting moves a keys.Hems YAML setting to a device-managed custom hems entry.
+func migrateLegacyHemsSetting() error {
+	raw, err := settings.String(keys.Hems)
+	if err != nil || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	_, err = config.AddConfig(templates.Hems,
+		map[string]any{"yaml": raw},
+		config.WithProperties(config.Properties{Type: "custom"}),
+	)
+	if err != nil {
+		return err
+	}
+
+	log.INFO.Println("migrated legacy hems yaml setting to device config")
+	return settings.Delete(keys.Hems)
+}
+
+func configureDbHems(site *core.Site) (hemsapi.API, error) {
+	dev, err := config.ConfigurationByClass(templates.Hems)
+	if err != nil || dev == nil {
+		return nil, err
+	}
+
+	cc := dev.Named()
+
+	var instance hemsapi.API
+	typ, other, err := config.CustomDevice(cc.Type, cc.Other)
+	if err != nil {
+		err = &DeviceError{cc.Name, fmt.Errorf("cannot decode custom %s '%s': %w", typ, cc.Name, err)}
+	} else {
+		instance, err = hems.NewFromConfig(context.TODO(), typ, other, site)
+		if err != nil {
+			err = &DeviceError{cc.Name, fmt.Errorf("cannot create %s '%s': %w", typ, cc.Name, err)}
+		}
+	}
+
+	// register device even on factory error so UI can edit/delete the broken config
+	if addErr := config.Hems().Add(config.NewConfigurableDevice(dev, instance)); addErr != nil && err == nil {
+		err = &DeviceError{cc.Name, addErr}
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	site.SetHEMS(instance)
+
+	go instance.Run()
+	return instance, nil
+}
+
+// networkSettings reads/migrates network settings
+func networkSettings(conf *globalconfig.Network) error {
+	if settings.Exists(keys.Network) {
+		return settings.Json(keys.Network, &conf)
+	}
+
+	return nil
+}
+
+// setup MDNS
+func configureMDNS(conf globalconfig.Network) error {
+	host := strings.TrimSuffix(conf.Host, ".local")
+	if host == "" {
+		host = "evcc"
+	}
+
+	internalURL := conf.InternalURL()
+	text := []string{"path=/", "internal_url=" + internalURL}
+
+	if externalURL := conf.ExternalURL(); externalURL != internalURL {
+		text = append(text, "external_url="+externalURL)
+	}
+
+	zc, err := zeroconf.RegisterProxy("evcc", "_http._tcp", "local.", conf.Port, host, nil, text, nil)
+	if err != nil {
+		return err
+	}
+
+	shutdown.Register(zc.Shutdown)
+
+	return nil
+}
+
+// setup OCPP
+func configureOCPP(cfg *ocpp.Config, externalUrl string) {
+	if settings.Exists(keys.Ocpp) {
+		if err := settings.Json(keys.Ocpp, cfg); err != nil {
+			log.WARN.Printf("ocpp: failed to load settings: %v", err)
+		}
+	}
+	ocpp.NewServer(*cfg, externalUrl)
+
+	// Load proxy forwarding rules from DB if present.
+	var rules []ocpp.ForwarderRule
+	if err := settings.Json(keys.OcppForwarder, &rules); err == nil && len(rules) > 0 {
+		// the forwarder relays through the central system; abort if it failed to start
+		if _, err := ocpp.Instance(); err != nil {
+			log.ERROR.Printf("ocpp: forwarder disabled: %v", err)
+			return
+		}
+		ocpp.ApplyForwarderRules(rules)
+	}
+}
+
+// setup EEBus
+func configureEEBus(conf *eebus.Config) error {
+	// migrate settings
+	if settings.Exists(keys.EEBus) {
+		if err := migrateYamlToJson(keys.EEBus, conf); err != nil {
+			return err
+		}
+	} else if conf.IsConfigured() {
+		yamlSource.eebus = globalconfig.YamlSourceFile
+	}
+
+	if !conf.IsConfigured() {
+		cc, err := eebus.DefaultConfig(conf)
+		if err != nil {
+			return err
+		}
+
+		*conf = *cc
+		if err := settings.SetJson(keys.EEBus, conf); err != nil {
+			return err
+		}
+	}
+
+	srv, err := eebus.NewServer(*conf)
+	if err != nil {
+		return fmt.Errorf("failed configuring eebus: %w", err)
+	}
+
+	shutdown.Register(srv.Shutdown)
+
+	return nil
+}
+
+func configureMessengers(confMessaging *globalconfig.Messaging, confEvents *globalconfig.MessagingEvents, vehicles messenger.Vehicles, valueChan chan<- util.Param, cache *util.ParamCache) (chan messenger.Event, error) {
+	// yaml config from file
+	if len(confMessaging.Events) != 0 || len(confMessaging.Services) != 0 {
+		yamlSource.messaging = globalconfig.YamlSourceFile
+	}
+
+	// yaml config from db (deprecated)
+	if settings.Exists(keys.Messaging) {
+		if yamlSource.messaging == globalconfig.YamlSourceFile {
+			// just warn, no error to not break previous behavior
+			log.WARN.Println("messaging configured via UI yaml; evcc.yaml config will be ignored")
+		}
+		*confMessaging = globalconfig.Messaging{}
+		if err := settings.Yaml(keys.Messaging, new(map[string]any), &confMessaging); err != nil {
+			return nil, err
+		}
+		yamlSource.messaging = globalconfig.YamlSourceDb
+	}
+
+	if settings.Exists(keys.MessagingEvents) {
+		*confEvents = globalconfig.MessagingEvents{}
+		if err := settings.Json(keys.MessagingEvents, &confEvents); err != nil {
+			return nil, err
+		}
+		if yamlSource.messaging != globalconfig.YamlSourceNone && confEvents != nil {
+			return nil, errors.New("yaml and device config exists for messaging; remove yaml config")
+		}
+	}
+
+	messageChan := make(chan messenger.Event, 1)
+
+	var eg errgroup.Group
+
+	for i, cc := range confMessaging.Services {
+		// add name for meter/charger parity
+		cc := config.Named{
+			Name:  fmt.Sprintf("push-%d", i+1),
+			Type:  cc.Type,
+			Other: cc.Other,
+		}
+
+		eg.Go(func() error {
+			return staticInstance("messenger", cc, messenger.NewFromConfig, config.Messengers())
+		})
+	}
+
+	// append devices from database
+	configurable, err := config.ConfigurationsByClass(templates.Messenger)
+	if err != nil {
+		return messageChan, err
+	}
+
+	for _, conf := range configurable {
+		eg.Go(func() error {
+			return configurableInstance("messenger", &conf, messenger.NewFromConfig, config.Messengers())
+		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		return messageChan, &ClassError{ClassMessenger, err}
+	}
+
+	var events globalconfig.MessagingEvents
+
+	if len(*confEvents) > 0 {
+		events = conf.MessagingEvents
+	} else {
+		events = confMessaging.Events
+	}
+
+	messageHub, err := messenger.NewHub(events, vehicles, cache)
+
+	if err != nil {
+		return messageChan, fmt.Errorf("failed configuring push services: %w", err)
+	}
+
+	for _, dev := range config.Messengers().Devices() {
+		if inst := dev.Instance(); inst != nil {
+			messageHub.Add(inst)
+		}
+	}
+
+	go messageHub.Run(messageChan, valueChan)
+
+	return messageChan, nil
+}
+
+func tariffInstance(name string, conf config.Typed) (api.Tariff, error) {
+	ctx := util.WithLogger(context.TODO(), util.NewLogger(name))
+
+	typ, other, err := config.CustomDevice(conf.Type, conf.Other)
+	if err != nil {
+		return nil, fmt.Errorf("cannot decode custom tariff '%s': %w", name, err)
+	}
+
+	instance, err := tariff.NewFromConfig(ctx, typ, other)
+	if err != nil {
+		if _, ok := errors.AsType[*util.ConfigError](err); ok {
+			return nil, err
+		}
+
+		// wrap non-config tariff errors to prevent fatals
+		log.ERROR.Printf("creating tariff %s failed: %v", name, err)
+		instance = tariff.NewWrapper(conf.Type, conf.Other, err)
+	}
+
+	return instance, nil
+}
+
+func configureSolarTariff(conf []config.Typed, t *api.Tariff) error {
+	var eg errgroup.Group
+	tt := make([]api.Tariff, len(conf))
+
+	for i, conf := range conf {
+		eg.Go(func() error {
+			if conf.Type == "" {
+				return errors.New("missing type")
+			}
+
+			name := fmt.Sprintf("%s-%s-%d", api.TariffUsageSolar, tariff.Name(conf), i)
+			res, err := tariffInstance(name, conf)
+			if err != nil {
+				return &DeviceError{name, err}
+			}
+
+			tt[i] = res
+			return nil
+		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		return err
+	}
+
+	*t = tariff.NewCombined(tt)
+	return nil
+}
+
+func configureTariff(conf config.Typed, deviceName string, target *api.Tariff) error {
+	if conf.Type != "" {
+		instance, err := tariffInstance("tariff", conf)
+		if err != nil {
+			return err
+		}
+		*target = instance
+		return nil
+	}
+	if deviceName != "" {
+		dev, err := config.Tariffs().ByName(deviceName)
+		if err != nil {
+			return fmt.Errorf("tariff device not found: %w", err)
+		}
+		*target = dev.Instance()
+	}
+	return nil
+}
+
+func configureSolarTariffs(confs []config.Typed, deviceNames []string, target *api.Tariff) error {
+	if len(confs) > 0 {
+		if len(confs) == 1 {
+			return configureTariff(confs[0], "", target)
+		}
+		return configureSolarTariff(confs, target)
+	}
+	if len(deviceNames) > 0 {
+		if len(deviceNames) == 1 {
+			return configureTariff(config.Typed{}, deviceNames[0], target)
+		}
+		tt := make([]api.Tariff, len(deviceNames))
+		for i, name := range deviceNames {
+			dev, err := config.Tariffs().ByName(name)
+			if err != nil {
+				return fmt.Errorf("tariff device %s not found: %w", name, err)
+			}
+			tt[i] = dev.Instance()
+		}
+		*target = tariff.NewCombined(tt)
+	}
+	return nil
+}
+
+func configureTariffs(conf *globalconfig.Tariffs, names ...string) (*tariff.Tariffs, error) {
+	tariffs := tariff.Tariffs{
+		Currency: currency.EUR,
+	}
+
+	// yaml config from file
+	if conf.IsConfigured() {
+		yamlSource.tariffs = globalconfig.YamlSourceFile
+	}
+
+	// yaml config from db (deprecated)
+	if settings.Exists(keys.Tariffs) {
+		if yamlSource.tariffs == globalconfig.YamlSourceFile {
+			// just warn, no error to not break previous behavior
+			log.WARN.Println("tariffs configured via UI; evcc.yaml config will be ignored")
+		}
+		*conf = globalconfig.Tariffs{}
+		if err := settings.Yaml(keys.Tariffs, new(map[string]any), &conf); err != nil {
+			return &tariffs, err
+		}
+		yamlSource.tariffs = globalconfig.YamlSourceDb
+	}
+
+	// device config from db
+	var refs globalconfig.TariffRefs
+	if settings.Exists(keys.TariffRefs) {
+		if err := settings.Json(keys.TariffRefs, &refs); err != nil {
+			return &tariffs, err
+		}
+		if yamlSource.tariffs != globalconfig.YamlSourceNone && refs.IsConfigured() {
+			return &tariffs, errors.New("tariffs are configured via UI; having an additional yaml config is not allowed")
+		}
+	}
+
+	// load tariff devices from database
+	configurable, err := config.ConfigurationsByClass(templates.Tariff)
+	if err != nil {
+		return &tariffs, err
+	}
+
+	var eg errgroup.Group
+
+	for _, conf := range configurable {
+		eg.Go(func() error {
+			cc := conf.Named()
+
+			if len(names) > 0 && !slices.Contains(names, cc.Name) {
+				return nil
+			}
+
+			instance, err := tariffInstance(cc.Name, config.Typed{Type: cc.Type, Other: cc.Other})
+			if err != nil {
+				return err
+			}
+
+			if e := config.Tariffs().Add(config.NewConfigurableDevice(&conf, instance)); e != nil {
+				return &DeviceError{cc.Name, e}
+			}
+
+			return nil
+		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		return &tariffs, err
+	}
+
+	// resolve tariff roles
+	eg = errgroup.Group{}
+	eg.Go(func() error { return configureTariff(conf.Grid, refs.Grid, &tariffs.Grid) })
+	eg.Go(func() error { return configureTariff(conf.FeedIn, refs.FeedIn, &tariffs.FeedIn) })
+	eg.Go(func() error { return configureTariff(conf.Co2, refs.Co2, &tariffs.Co2) })
+	eg.Go(func() error { return configureTariff(conf.Planner, refs.Planner, &tariffs.Planner) })
+	eg.Go(func() error { return configureSolarTariffs(conf.Solar, refs.Solar, &tariffs.Solar) })
+	if err := eg.Wait(); err != nil {
+		return &tariffs, &ClassError{ClassTariff, err}
+	}
+
+	// validate currency
+	if cur, _ := settings.String(keys.Currency); cur != "" {
+		conf.Currency = cur
+	}
+	if conf.Currency != "" {
+		cur, err := currency.ParseISO(conf.Currency)
+		if err != nil {
+			return &tariffs, err
+		}
+		tariffs.Currency = cur
+	}
+
+	return &tariffs, nil
+}
+
+func configureDevices(conf globalconfig.All) error {
+	// collect references for filtering used devices
+	if err := collectRefs(conf); err != nil {
+		return err
+	}
+
+	// make sure all devices are configured
+	var errs []error
+
+	if err := configureMeters(conf.Meters, references.meter...); err != nil {
+		errs = append(errs, &ClassError{ClassMeter, err})
+	}
+
+	if err := configureChargers(conf.Chargers, references.charger...); err != nil {
+		errs = append(errs, &ClassError{ClassCharger, err})
+	}
+
+	if err := configureVehicles(conf.Vehicles); err != nil {
+		errs = append(errs, &ClassError{ClassVehicle, err})
+	}
+
+	if err := configureCircuits(&conf.Circuits); err != nil {
+		errs = append(errs, &ClassError{ClassCircuit, err})
+	}
+
+	return joinErrors(errs...)
+}
+
+func configureModbusProxy(conf *[]globalconfig.ModbusProxy) error {
+	if settings.Exists(keys.ModbusProxy) {
+		if err := migrateYamlToJson(keys.ModbusProxy, conf); err != nil {
+			return err
+		}
+	}
+
+	// prevent panic
+	if conf == nil {
+		return nil
+	}
+
+	for _, cfg := range *conf {
+		var mode modbus.ReadOnlyMode
+		mode, err := modbus.ReadOnlyModeString(cfg.ReadOnly)
+		if err != nil {
+			return err
+		}
+
+		if err = modbus.StartProxy(cfg.Port, cfg.Settings, mode); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func configureSiteAndLoadpoints(conf *globalconfig.All) (*core.Site, error) {
+	// migrate settings
+	if settings.Exists(keys.Interval) {
+		d, err := settings.Int(keys.Interval)
+		if err != nil {
+			return nil, err
+		}
+		conf.Interval = time.Duration(d)
+	}
+
+	var errs []error
+
+	if err := configureDevices(*conf); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := configureLoadpoints(*conf); err != nil {
+		errs = append(errs, &ClassError{ClassLoadpoint, err})
+	}
+
+	tariffs, err := configureTariffs(&conf.Tariffs, references.tariff...)
+	if err != nil {
+		errs = append(errs, &ClassError{ClassTariff, err})
+	}
+
+	loadpoints := lo.Map(config.Loadpoints().Devices(), func(dev config.Device[loadpoint.API], _ int) *core.Loadpoint {
+		return dev.Instance().(*core.Loadpoint)
+	})
+
+	site, err := configureSite(conf.Site, loadpoints, tariffs)
+	if err != nil {
+		errs = append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		return site, joinErrors(errs...)
+	}
+
+	if len(config.Circuits().Devices()) > 0 {
+		if err := validateCircuits(loadpoints); err != nil {
+			return site, &ClassError{ClassCircuit, err}
+		}
+	}
+
+	return site, nil
+}
+
+func validateCircuits(loadpoints []*core.Loadpoint) error {
+	var hasRoot bool
+
+CONTINUE:
+	for _, dev := range config.Circuits().Devices() {
+		instance := dev.Instance()
+
+		isRoot := instance.GetParent() == nil
+		if isRoot {
+			if hasRoot {
+				return errors.New("multiple root circuits")
+			}
+
+			hasRoot = true
+		}
+
+		if slices.ContainsFunc(loadpoints, func(lp *core.Loadpoint) bool {
+			return lp.GetCircuit() == instance
+		}) {
+			continue CONTINUE
+		}
+
+		if !isRoot && !instance.HasMeter() {
+			log.INFO.Printf("circuit %s has no meter and no loadpoint assigned", dev.Config().Name)
+		}
+	}
+
+	if !hasRoot {
+		return errors.New("missing root circuit")
+	}
+
+	return nil
+}
+
+func configureSite(conf map[string]any, loadpoints []*core.Loadpoint, tariffs *tariff.Tariffs) (*core.Site, error) {
+	site, err := core.NewSiteFromConfig(conf)
+	if err != nil {
+		return site, err
+	}
+
+	if err := site.Boot(log, loadpoints, tariffs); err != nil {
+		return site, fmt.Errorf("failed booting site: %w", err)
+	}
+
+	return site, nil
+}
+
+func newLoadpoint(idx int, name string, other map[string]any, settingsFn func(*util.Logger) coresettings.Settings) (*core.Loadpoint, error) {
+	log := util.NewLoggerWithLoadpoint("lp-"+strconv.Itoa(idx), idx)
+
+	collector, err := metrics.NewCollector(metrics.Loadpoint, name, "")
+	if err != nil {
+		return nil, err
+	}
+
+	lp, err := core.NewLoadpointFromConfig(log, settingsFn(log), collector, other)
+	if err != nil {
+		return lp, err
+	}
+
+	return lp, nil
+}
+
+func configureLoadpoints(conf globalconfig.All) error {
+	for id, cc := range conf.Loadpoints {
+		idx := id + 1
+		cc.Name = "lp-" + strconv.Itoa(idx)
+
+		instance, err := newLoadpoint(idx, cc.Name, cc.Other, func(*util.Logger) coresettings.Settings {
+			return coresettings.NewDatabaseSettingsAdapter(fmt.Sprintf("lp%d.", idx))
+		})
+		if err != nil {
+			return &DeviceError{cc.Name, err}
+		}
+
+		if err := config.Loadpoints().Add(config.NewStaticDevice(cc, loadpoint.API(instance))); err != nil {
+			return &DeviceError{cc.Name, err}
+		}
+	}
+
+	// append devices from database
+	configurable, err := config.ConfigurationsByClass(templates.Loadpoint)
+	if err != nil {
+		return err
+	}
+
+	for _, conf := range configurable {
+		cc := conf.Named()
+		idx := len(config.Loadpoints().Devices()) + 1
+
+		dynamic, static, err := loadpoint.SplitConfig(cc.Other)
+		if err != nil {
+			return &DeviceError{cc.Name, err}
+		}
+
+		instance, err := newLoadpoint(idx, cc.Name, static, func(log *util.Logger) coresettings.Settings {
+			return coresettings.NewConfigSettingsAdapter(log, &conf)
+		})
+		if err != nil {
+			err = &DeviceError{cc.Name, err}
+		}
+
+		dev := config.NewConfigurableDevice[loadpoint.API](&conf, instance)
+		if e := config.Loadpoints().Add(dev); e != nil && err == nil {
+			err = &DeviceError{cc.Name, e}
+		}
+
+		if instance != nil {
+			// ignore dynamic config in case of startup errors that will leave instance empty
+			if e := dynamic.Apply(instance); e != nil && err == nil {
+				err = &DeviceError{cc.Name, e}
+			}
+		}
+
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// configureAuth handles routing for devices. For now only api.AuthProvider related routes
+func configureAuth(router *mux.Router, paramC chan<- util.Param) {
+	auth := router.PathPrefix("/providerauth").Subrouter()
+	auth.Use(handlers.CompressHandler)
+	auth.Use(handlers.CORS(
+		handlers.AllowedHeaders([]string{"Content-Type"}),
+	))
+
+	// backwards-compatible revert of https://github.com/evcc-io/evcc/pull/21266
+	router.PathPrefix("/oauth").Handler(auth)
+
+	// wire the handler
+	providerauth.Setup(auth, paramC)
+}
+
+// isExperimental returns if experimental features are enabled
+func isExperimental() bool {
+	b, _ := settings.Bool(keys.Experimental)
+	return b
+}
+
+// isOptimizer returns if optimizer is enabled
+func isOptimizer() bool {
+	b, _ := settings.Bool(keys.Optimizer)
+	return b
+}
+
+// isMcp returns if MCP service is enabled
+func isMcp() bool {
+	return isExperimental()
+}

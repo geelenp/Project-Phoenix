@@ -1,0 +1,193 @@
+package vehicle
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/api/implement"
+	"github.com/evcc-io/evcc/plugin"
+	"github.com/evcc-io/evcc/util"
+)
+
+// Vehicle is an api.Vehicle implementation with configurable getters and setters.
+type Vehicle struct {
+	*embed
+	implement.Caps
+	socG func() (float64, error)
+}
+
+func init() {
+	registry.AddCtx(api.Custom, NewConfigurableFromConfig)
+}
+
+// NewConfigurableFromConfig creates a new vehicle from config
+func NewConfigurableFromConfig(ctx context.Context, other map[string]any) (api.Vehicle, error) {
+	var cc struct {
+		embed         `mapstructure:",squash"`
+		Soc           plugin.Config
+		LimitSoc      *plugin.Config
+		Status        *plugin.Config
+		Range         *plugin.Config
+		Odometer      *plugin.Config
+		Climater      *plugin.Config
+		MaxCurrent    *plugin.Config
+		GetMaxCurrent *plugin.Config
+		FinishTime    *plugin.Config
+		Wakeup        *plugin.Config
+		ChargeEnable  *plugin.Config
+		ChargedEnergy *plugin.Config
+		Position      *struct {
+			Latitude  plugin.Config `mapstructure:"latitude"`
+			Longitude plugin.Config `mapstructure:"longitude"`
+		} `mapstructure:"position"`
+	}
+
+	if err := util.DecodeOther(other, &cc); err != nil {
+		return nil, err
+	}
+
+	socG, err := cc.Soc.FloatGetter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("soc: %w", err)
+	}
+
+	v := &Vehicle{
+		embed: &cc.embed,
+		Caps:  implement.New(),
+		socG:  socG,
+	}
+
+	// decorate limitSoc
+	limitSoc, err := cc.LimitSoc.IntGetter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("limitSoc: %w", err)
+	}
+	implement.May(v, implement.SocLimiter(limitSoc))
+
+	// decorate status
+	status, err := cc.Status.StringGetter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("status: %w", err)
+	}
+	if status != nil {
+		implement.Has(v, implement.ChargeState(func() (api.ChargeStatus, error) {
+			s, err := status()
+			if err != nil {
+				return api.StatusNone, err
+			}
+			return api.ChargeStatusString(s)
+		}))
+	}
+
+	// decorate range
+	rng, err := cc.Range.IntGetter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("range: %w", err)
+	}
+	implement.May(v, implement.VehicleRange(rng))
+
+	// decorate odometer
+	odo, err := cc.Odometer.FloatGetter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("odometer: %w", err)
+	}
+	implement.May(v, implement.VehicleOdometer(odo))
+
+	// decorate climater
+	climater, err := cc.Climater.BoolGetter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("climater: %w", err)
+	}
+	implement.May(v, implement.VehicleClimater(climater))
+
+	// decorate maxCurrent
+	maxCurrent, err := cc.MaxCurrent.IntSetter(ctx, "maxcurrent")
+	if err != nil {
+		return nil, fmt.Errorf("maxCurrent: %w", err)
+	}
+	implement.May(v, implement.CurrentController(maxCurrent))
+
+	// decorate getMaxCurrent
+	getMaxCurrent, err := cc.GetMaxCurrent.FloatGetter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getMaxCurrent: %w", err)
+	}
+	implement.May(v, implement.CurrentGetter(getMaxCurrent))
+
+	// decorate position
+	if cc.Position != nil {
+		latG, err := cc.Position.Latitude.FloatGetter(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("latitude: %w", err)
+		}
+		lonG, err := cc.Position.Longitude.FloatGetter(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("longitude: %w", err)
+		}
+		implement.Has(v, implement.VehiclePosition(func() (float64, float64, error) {
+			lat, err := latG()
+			if err != nil {
+				return 0, 0, err
+			}
+			lon, err := lonG()
+			if err != nil {
+				return 0, 0, err
+			}
+			// MQTT sources may report (0,0) when no GPS fix is available
+			if lat == 0 && lon == 0 {
+				return 0, 0, api.ErrNotAvailable
+			}
+			return lat, lon, nil
+		}))
+	}
+
+	// decorate finishtime
+	finishTime, err := cc.FinishTime.TimeGetter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("finishTime: %w", err)
+	}
+	implement.May(v, implement.VehicleFinishTimer(finishTime))
+
+	// decorate wakeup
+	wakeup, err := cc.Wakeup.BoolSetter(ctx, "wakeup")
+	if err != nil {
+		return nil, fmt.Errorf("wakeup: %w", err)
+	}
+	if wakeup != nil {
+		implement.Has(v, implement.Resurrector(func() error {
+			return wakeup(true)
+		}))
+	}
+
+	// decorate chargeEnable
+	chargeEnable, err := cc.ChargeEnable.BoolSetter(ctx, "chargeenable")
+	if err != nil {
+		return nil, fmt.Errorf("chargeEnable: %w", err)
+	}
+	implement.May(v, implement.ChargeController(chargeEnable))
+
+	// decorate chargedenergy
+	chargedEnergy, err := cc.ChargedEnergy.FloatGetter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("charged energy: %w", err)
+	}
+	implement.May(v, implement.ChargeRater(chargedEnergy))
+
+	switch {
+	case maxCurrent == nil && getMaxCurrent != nil:
+		return nil, errors.New("cannot have current without current control")
+	case status == nil && maxCurrent != nil:
+		return nil, errors.New("cannot have current control without status")
+	case status == nil && chargeEnable != nil:
+		return nil, errors.New("cannot have charge control without status")
+	}
+
+	return v, nil
+}
+
+// Soc implements the api.Vehicle interface
+func (v *Vehicle) Soc() (float64, error) {
+	return v.socG()
+}

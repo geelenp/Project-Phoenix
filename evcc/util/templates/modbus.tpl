@@ -1,0 +1,25 @@
+{{- define "modbus" }}
+id: {{ .id }}
+{{- if or (eq .modbus "rs485serial") .rs485serial }}
+# RS485 via adapter (Modbus RTU)
+device: {{ .device }}
+baudrate: {{ .baudrate }}
+comset: {{ .comset }}
+{{- else if or (eq .modbus "rs485tcpip") .rs485tcpip }}
+# RS485 via TCP/IP (Modbus RTU)
+uri: {{ joinHostPort .host .port }}
+rtu: true
+{{- else if or (eq .modbus "tcpip") .tcpip }}
+# Modbus TCP
+uri: {{ joinHostPort .host .port }}
+rtu: false
+{{- else if or (eq .modbus "udp") .udp }}
+# Modbus UDP
+uri: {{ joinHostPort .host .port }}
+udp: true
+rtu: true
+{{- else }}
+# configuration error - should not happen
+modbusConnectionTypeNotDefined: {{ .modbus }}
+{{- end }}
+{{- end }}

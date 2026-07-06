@@ -1,0 +1,296 @@
+package meter
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"sort"
+	"text/tabwriter"
+
+	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/api/implement"
+	"github.com/evcc-io/evcc/plugin/sma"
+	"github.com/evcc-io/evcc/util"
+	"gitlab.com/bboehmke/sunny"
+)
+
+// SMA supporting SMA Home Manager 2.0, SMA Energy Meter 30 and SMA inverter
+type SMA struct {
+	implement.Caps
+	uri    string
+	scale  float64
+	usage  string
+	dc     bool
+	device *sma.Device
+}
+
+func init() {
+	registry.Add("sma", NewSMAFromConfig)
+}
+
+// NewSMAFromConfig creates an SMA meter from generic config
+func NewSMAFromConfig(other map[string]any) (api.Meter, error) {
+	cc := struct {
+		batteryCapacity          `mapstructure:",squash"`
+		batteryPowerLimits       `mapstructure:",squash"`
+		batterySocLimits         `mapstructure:",squash"`
+		URI, Password, Interface string
+		Usage                    string
+		Serial                   uint32
+		Scale                    float64 // scale power, swap energy registers
+		DC                       bool    // expose DC measurements (pv/battery)
+	}{
+		Password: "0000",
+		Scale:    1,
+	}
+
+	if err := util.DecodeOther(other, &cc); err != nil {
+		return nil, err
+	}
+
+	return NewSMA(cc.URI, cc.Password, cc.Interface, cc.Serial, cc.Scale, cc.Usage, cc.DC, cc.batteryCapacity.Decorator(), cc.batterySocLimits.Decorator(), cc.batteryPowerLimits.Decorator())
+}
+
+// NewSMA creates an SMA meter
+func NewSMA(uri, password, iface string, serial uint32, scale float64, usage string, dc bool, capacity func() float64, batterySocLimits, batteryPowerLimits func() (float64, float64)) (*SMA, error) {
+	sm := &SMA{
+		Caps:  implement.New(),
+		uri:   uri,
+		scale: scale,
+		usage: usage,
+		dc:    dc,
+	}
+
+	discoverer, err := sma.GetDiscoverer(iface)
+	if err != nil {
+		return nil, fmt.Errorf("discoverer: %w", err)
+	}
+
+	switch {
+	case uri != "":
+		sm.device, err = discoverer.DeviceByIP(uri, password)
+		if err != nil {
+			return nil, err
+		}
+	case serial > 0:
+		sm.device = discoverer.DeviceBySerial(serial, password)
+		if sm.device == nil {
+			return nil, fmt.Errorf("device not found: %d", serial)
+		}
+	default:
+		return nil, errors.New("missing uri or serial")
+	}
+
+	// call UpdateValues first to check if we get an error
+	if err := sm.device.UpdateValues(); err != nil {
+		return nil, err
+	}
+
+	// start update loop manually to get values as fast as possible
+	go sm.device.Run()
+
+	isInverter := !sm.device.IsEnergyMeter()
+	isHybridInverter := isInverter && dc
+
+	if isInverter && usage == "battery" {
+		implement.Has(sm, implement.Battery(sm.soc))
+		implement.May(sm, implement.BatteryCapacity(capacity))
+		implement.May(sm, implement.BatterySocLimiter(batterySocLimits))
+		implement.May(sm, implement.BatteryPowerLimiter(batteryPowerLimits))
+	}
+
+	if isHybridInverter && usage == "pv" {
+		implement.Has(sm, implement.MaxACPowerGetter(sm.maxACPower))
+	}
+
+	if !isHybridInverter {
+		implement.Has(sm, implement.PhaseCurrents(sm.currents))
+		implement.Has(sm, implement.PhasePowers(sm.powers))
+	}
+
+	if !(isHybridInverter && usage == "pv") {
+		implement.Has(sm, implement.MeterReturnEnergy(sm.returnEnergy))
+	}
+
+	return sm, nil
+}
+
+// CurrentPower implements the api.Meter interface
+func (sm *SMA) CurrentPower() (float64, error) {
+	values, err := sm.device.Values()
+
+	if !sm.device.IsEnergyMeter() {
+		switch sm.usage {
+		case "grid":
+			// grid: import minus export (consumption positive)
+			return sma.AsFloat(values[sunny.GridPowerImport]) - sma.AsFloat(values[sunny.GridPowerExport]), err
+		case "pv":
+			if sm.dc {
+				return sma.AsFloat(values[sunny.PvPower]), err
+			}
+		case "battery":
+			if sm.dc {
+				return sma.AsFloat(values[sunny.BatteryVoltage]) * sma.AsFloat(values[sunny.BatteryCurrent]), err
+			}
+		}
+	}
+
+	return sm.scale * (sma.AsFloat(values[sunny.ActivePowerPlus]) - sma.AsFloat(values[sunny.ActivePowerMinus])), err
+}
+
+var _ api.MeterEnergy = (*SMA)(nil)
+
+// TotalEnergy implements the api.MeterEnergy interface
+func (sm *SMA) TotalEnergy() (float64, error) {
+	values, err := sm.device.Values()
+
+	if !sm.device.IsEnergyMeter() {
+		switch sm.usage {
+		case "grid":
+			return sma.AsFloat(values[sunny.GridEnergyImportKWh]), err
+		case "pv":
+			if sm.dc {
+				return sma.AsFloat(values[sunny.PvEnergyTotalKWh]), err
+			}
+		case "battery":
+			if sm.dc {
+				return sma.AsFloat(values[sunny.BatteryEnergyDischargeKWh]), err
+			}
+		}
+	}
+
+	if sm.scale < 0 {
+		return sma.AsFloat(values[sunny.ActiveEnergyMinus]) / 3600000, err
+	}
+
+	return sma.AsFloat(values[sunny.ActiveEnergyPlus]) / 3600000, err
+}
+
+// returnEnergy implements the api.MeterReturnEnergy interface
+func (sm *SMA) returnEnergy() (float64, error) {
+	values, err := sm.device.Values()
+
+	if !sm.device.IsEnergyMeter() {
+		switch sm.usage {
+		case "grid":
+			return sma.AsFloat(values[sunny.GridEnergyExportKWh]), err
+		case "battery":
+			if sm.dc {
+				return sma.AsFloat(values[sunny.BatteryEnergyChargeKWh]), err
+			}
+		}
+	}
+
+	if sm.scale < 0 {
+		return sma.AsFloat(values[sunny.ActiveEnergyPlus]) / 3600000, err
+	}
+
+	return sma.AsFloat(values[sunny.ActiveEnergyMinus]) / 3600000, err
+}
+
+var _ api.PhaseVoltages = (*SMA)(nil)
+
+// Voltages implements the api.PhaseVoltages interface
+func (sm *SMA) Voltages() (float64, float64, float64, error) {
+	values, err := sm.device.Values()
+
+	var res [3]float64
+	for i, id := range []sunny.ValueID{sunny.VoltageL1, sunny.VoltageL2, sunny.VoltageL3} {
+		res[i] = sma.AsFloat(values[id])
+	}
+
+	return res[0], res[1], res[2], err
+}
+
+// currents implements the api.PhaseCurrents interface
+func (sm *SMA) currents() (float64, float64, float64, error) {
+	values, err := sm.device.Values()
+
+	var powers [3]float64
+	for i, id := range []sunny.ValueID{sunny.ActivePowerMinusL1, sunny.ActivePowerMinusL2, sunny.ActivePowerMinusL3} {
+		if p := sma.AsFloat(values[id]); p > 0 {
+			powers[i] = -p
+		}
+	}
+
+	var res [3]float64
+	for i, id := range []sunny.ValueID{sunny.CurrentL1, sunny.CurrentL2, sunny.CurrentL3} {
+		res[i] = util.SignFromPower(sma.AsFloat(values[id]), powers[i])
+	}
+
+	return sm.scale * res[0], sm.scale * res[1], sm.scale * res[2], err
+}
+
+// powers implements the api.PhasePowers interface
+func (sm *SMA) powers() (float64, float64, float64, error) {
+	values, err := sm.device.Values()
+
+	var res [3]float64
+	for i, id := range []sunny.ValueID{sunny.ActivePowerPlusL1, sunny.ActivePowerPlusL2, sunny.ActivePowerPlusL3} {
+		res[i] = sma.AsFloat(values[id])
+	}
+	for i, id := range []sunny.ValueID{sunny.ActivePowerMinusL1, sunny.ActivePowerMinusL2, sunny.ActivePowerMinusL3} {
+		res[i] -= sma.AsFloat(values[id])
+	}
+
+	return sm.scale * res[0], sm.scale * res[1], sm.scale * res[2], err
+}
+
+// maxACPower returns the inverter's nominal max active power (LRI 0x411E)
+func (sm *SMA) maxACPower() float64 {
+	values, err := sm.device.Values()
+	if err != nil {
+		return 0
+	}
+
+	return sma.AsFloat(values[sunny.ActivePowerMax])
+}
+
+// soc implements the api.Battery interface
+func (sm *SMA) soc() (float64, error) {
+	values, err := sm.device.Values()
+	if err != nil {
+		return 0, err
+	}
+
+	soc, ok := values[sunny.BatteryCharge]
+	if !ok {
+		return 0, api.ErrNotAvailable
+	}
+
+	return sma.AsFloat(soc), nil
+}
+
+var _ api.Diagnosis = (*SMA)(nil)
+
+// Diagnose implements the api.Diagnosis interface
+func (sm *SMA) Diagnose() {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', 0)
+
+	fmt.Fprintf(w, "  IP:\t%s\n", sm.device.Address())
+	fmt.Fprintf(w, "  Serial:\t%d\n", sm.device.SerialNumber())
+	fmt.Fprintf(w, "  EnergyMeter:\t%v\n", sm.device.IsEnergyMeter())
+	fmt.Fprintln(w)
+
+	if values, err := sm.device.Values(); err == nil {
+		ids := make([]sunny.ValueID, 0, len(values))
+		for k := range values {
+			ids = append(ids, k)
+		}
+
+		sort.Slice(ids, func(i, j int) bool {
+			return ids[i].String() < ids[j].String()
+		})
+
+		for _, id := range ids {
+			switch values[id].(type) {
+			case float64:
+				fmt.Fprintf(w, "  %s:\t%f %s\n", id.String(), values[id], sunny.GetValueInfo(id).Unit)
+			default:
+				fmt.Fprintf(w, "  %s:\t%v %s\n", id.String(), values[id], sunny.GetValueInfo(id).Unit)
+			}
+		}
+	}
+
+	w.Flush()
+}

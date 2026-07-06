@@ -1,0 +1,28 @@
+template: ostrom
+products:
+  - brand: Ostrom
+requirements:
+  description:
+    en: "Create a 'Production Client' in the Ostrom developer portal: [developer.ostrom-api.io](https://developer.ostrom-api.io/)"
+    de: "Erzeuge einen 'Production Client' im Ostrom-Entwicklerportal: [developer.ostrom-api.io](https://developer.ostrom-api.io/)"
+  evcc: ["skiptest"]
+group: price
+countries: ["DE"]
+params:
+  - name: clientid
+    example: 476c477d8a039529478ebd690d35ddd80e3308ffc49b59c65b142321aee963a4
+  - name: clientsecret
+    example: 476c477d8a039529478ebd690d35ddd80e3308ffc49b59c65b142321aee963a4476c477d8a039529478ebd690d35ddd80e3308ffc49b59c65b142321aee963a4a
+  - name: contract
+    example: 100523456
+    description:
+      en: Contract number
+      de: Vertragsnummer
+    help:
+      de: Nur erforderlich, wenn mehrere Verträge unter einem Benutzer existieren
+      en: Only required if multiple contracts belong to the same user
+render: |
+  type: ostrom
+  clientid: {{ .clientid }}
+  clientsecret: {{ .clientsecret }}
+  contract: {{ .contract }}

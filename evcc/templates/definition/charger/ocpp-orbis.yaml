@@ -1,0 +1,13 @@
+template: ocpp-orbis
+covers: ["orbis-viaris"]
+products:
+  - brand: Orbis
+    description:
+      generic: Viaris
+capabilities: ["dim"]
+requirements:
+  evcc: ["sponsorship", "skiptest"]
+params:
+  - preset: ocpp
+render: |
+  {{ include "ocpp" . }}

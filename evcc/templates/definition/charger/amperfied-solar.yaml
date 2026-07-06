@@ -1,0 +1,20 @@
+template: amperfied-solar
+products:
+  - brand: Amperfied
+    description:
+      generic: Wallbox connect.solar
+capabilities: ["mA", "rfid", "1p3p", "meter", "dim"]
+requirements:
+  evcc: ["sponsorship"]
+caveats:
+  - description:
+      de: Automatische Phasenumschaltung (1P/3P) ist unzuverlässig und kann fehlschlagen.
+      en: Automatic phase switching (1P/3P) is unreliable and may fail.
+params:
+  - name: modbus
+    choice: ["tcpip"]
+    id: 255
+render: |
+  type: amperfied
+  {{- include "modbus" . }}
+  phases1p3p: true

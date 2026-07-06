@@ -1,0 +1,18 @@
+template: sma-home-manager
+products:
+  - brand: SMA
+    description:
+      generic: Sunny Home Manager 2.0
+requirements:
+  evcc: ["skiptest"]
+params:
+  - name: usage
+    choice: ["grid"]
+  - name: host
+  - name: interface
+render: |
+  type: sma
+  uri: {{ .host }}
+  {{- if .interface }}
+  interface: {{ .interface }}
+  {{- end }}

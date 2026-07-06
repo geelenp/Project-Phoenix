@@ -1,0 +1,196 @@
+template: growatt-hybrid-tlxh
+products:
+  - brand: Growatt
+    description:
+      generic: TL-X(H) Hybrid Inverter
+capabilities: ["battery-control"]
+params:
+  - name: usage
+    choice: ["grid", "pv", "battery"]
+  - name: modbus
+    choice: ["rs485", "tcpip"]
+    baudrate: 9600
+    id: 1
+  - name: maxacpower
+  - preset: battery-params
+render: |
+  type: custom
+  {{- if eq .usage "grid" }}
+  power:
+    source: calc
+    add:
+    - source: modbus
+      {{- include "modbus" . | indent 4 }}
+      register:
+        address: 3041 # Total forward power
+        type: input
+        decode: uint32
+      scale: 0.1
+    - source: modbus
+      {{- include "modbus" . | indent 4 }}
+      register:
+        address: 3043 # Total reverse power
+        type: input
+        decode: uint32
+      scale: -0.1
+  energy:
+    source: modbus
+    {{- include "modbus" . | indent 2 }}
+    register:
+      address: 3069 # Total energy to user
+      type: input
+      decode: uint32
+    scale: 0.1
+  {{- end }}
+  {{- if eq .usage "pv" }}
+  power:
+    source: calc
+    add:
+    - source: modbus
+      {{- include "modbus" . | indent 4 }}
+      register:
+        address: 3005 # PV1 power
+        type: input
+        decode: uint32
+      scale: 0.1
+    - source: modbus
+      {{- include "modbus" . | indent 4 }}
+      register:
+        address: 3009 # PV2 power
+        type: input
+        decode: uint32
+      scale: 0.1
+    - source: modbus
+      {{- include "modbus" . | indent 4 }}
+      register:
+        address: 3013 # PV3 power
+        type: input
+        decode: uint32
+      scale: 0.1
+    - source: modbus
+      {{- include "modbus" . | indent 4 }}
+      register:
+        address: 3017 # PV4 power
+        type: input
+        decode: uint32
+      scale: 0.1
+  energy:
+    source: modbus
+    {{- include "modbus" . | indent 2 }}
+    register:
+      address: 3053 # PV energy total
+      type: input
+      decode: uint32
+    scale: 0.1
+  maxacpower: {{ .maxacpower }} # W
+  {{- end }}
+  {{- if eq .usage "battery" }}
+  power:
+    source: calc
+    add:
+    - source: modbus
+      {{- include "modbus" . | indent 4 }}
+      register:
+        address: 3178 # Discharge power
+        type: input
+        decode: uint32
+      scale: 0.1
+    - source: modbus
+      {{- include "modbus" . | indent 4 }}
+      register:
+        address: 3180 # Pcharge1 Charge power
+        type: input
+        decode: uint32
+      scale: -0.1
+  energy:
+    source: modbus
+    {{- include "modbus" . | indent 2 }}
+    register:
+      address: 3127 # Total discharge energy
+      type: input
+      decode: uint32
+    scale: 0.1
+  soc:
+    source: modbus
+    {{- include "modbus" . | indent 2 }}
+    register:
+      address: 3171 # SOC
+      type: input
+      decode: uint16
+  batterymode:
+    source: switch
+    switch:
+    - case: 1 # normal -> disable "battery first" and "ac charge"
+      set:
+        source: sequence
+        set:
+        # Time-1 "battery first" slot: start (3038) and end (3039) time words must be written
+        # in a single FC16 multi-register transaction. The firmware rejects a standalone write
+        # to the end-time register 3039 with modbus exception 0.
+        # value = (start << 16) | end = (8192 << 16) | 5947 = 0x2000173B; bit15=0 -> slot disabled
+        - source: const
+          value: 536876859
+          set:
+            source: modbus
+            {{- include "modbus" . | indent 10 }}
+            register:
+              address: 3038
+              type: writemultiple
+              decode: uint32
+        - source: const
+          value: 0
+          set:
+            source: modbus
+            {{- include "modbus" . | indent 10 }}
+            register:
+              address: 3049
+              type: writemultiple
+              decode: uint16
+    - case: 2 # hold -> enable "battery first" and disable "ac charge"
+      set:
+        source: sequence
+        set:
+        # value = (start << 16) | end = (40960 << 16) | 5947 = 0xA000173B; bit15=1 -> slot enabled
+        - source: const
+          value: 2684360507
+          set:
+            source: modbus
+            {{- include "modbus" . | indent 10 }}
+            register:
+              address: 3038
+              type: writemultiple
+              decode: uint32
+        - source: const
+          value: 0
+          set:
+            source: modbus
+            {{- include "modbus" . | indent 10 }}
+            register:
+              address: 3049
+              type: writemultiple
+              decode: uint16
+    - case: 3 # charge -> enable "battery first" and "ac charge"
+      set:
+        source: sequence
+        set:
+        # value = (start << 16) | end = (40960 << 16) | 5947 = 0xA000173B; bit15=1 -> slot enabled
+        - source: const
+          value: 2684360507
+          set:
+            source: modbus
+            {{- include "modbus" . | indent 10 }}
+            register:
+              address: 3038
+              type: writemultiple
+              decode: uint32
+        - source: const
+          value: 1
+          set:
+            source: modbus
+            {{- include "modbus" . | indent 10 }}
+            register:
+              address: 3049
+              type: writemultiple
+              decode: uint16
+  {{- include "battery-params" . }}
+  {{- end }}

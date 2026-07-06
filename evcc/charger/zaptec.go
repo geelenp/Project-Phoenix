@@ -1,0 +1,462 @@
+package charger
+
+// LICENSE
+
+// Copyright (c) evcc.io (andig, naltatis, premultiply)
+
+// This module is NOT covered by the MIT license. All rights reserved.
+
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"net/http"
+	"sort"
+	"time"
+
+	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/api/implement"
+	"github.com/evcc-io/evcc/charger/zaptec"
+	"github.com/evcc-io/evcc/util"
+	"github.com/evcc-io/evcc/util/request"
+	"github.com/evcc-io/evcc/util/sponsor"
+	"github.com/evcc-io/evcc/util/transport"
+	"golang.org/x/oauth2"
+)
+
+// https://api.zaptec.com/help/index.html
+// https://api.zaptec.com/.well-known/openid-configuration/
+
+// Zaptec charger implementation
+
+const _ZaptecGo2PhaseSwitchCurrent = 32.0 // threshold (in A) at which Zaptec Go 2 switches to single-phase according to product/protocol specs
+
+type Zaptec struct {
+	*request.Helper
+	implement.Caps
+	log        *util.Logger
+	statusG    util.Cacheable[zaptec.StateResponse]
+	instance   zaptec.Charger
+	version    int
+	enabled    bool
+	priority   bool
+	passive    bool
+	lastStatus int
+}
+
+func init() {
+	registry.AddCtx("zaptec", NewZaptecFromConfig)
+}
+
+// NewZaptecFromConfig creates a Zaptec Pro charger from generic config
+func NewZaptecFromConfig(ctx context.Context, other map[string]any) (api.Charger, error) {
+	cc := struct {
+		User, Password string
+		Id             string
+		Priority       bool
+		Passive        bool
+		Cache          time.Duration
+	}{
+		Cache: time.Second,
+	}
+
+	if err := util.DecodeOther(other, &cc); err != nil {
+		return nil, err
+	}
+
+	if cc.User == "" || cc.Password == "" {
+		return nil, api.ErrMissingCredentials
+	}
+
+	return NewZaptec(ctx, cc.User, cc.Password, cc.Id, cc.Priority, cc.Passive, cc.Cache)
+}
+
+// NewZaptec creates Zaptec charger
+func NewZaptec(_ context.Context, user, password, id string, priority bool, passive bool, cache time.Duration) (api.Charger, error) {
+	log := util.NewLogger("zaptec").Redact(user, password)
+
+	if !sponsor.IsAuthorized() {
+		return nil, api.ErrSponsorRequired
+	}
+
+	c := &Zaptec{
+		Helper:   request.NewHelper(log),
+		Caps:     implement.New(),
+		log:      log,
+		priority: priority,
+		passive:  passive,
+	}
+
+	// Add User-Agent header for Zaptec API compliance
+	c.Client.Transport = &transport.Decorator{
+		Decorator: transport.DecorateHeaders(map[string]string{
+			"User-Agent": "evcc/" + util.Version,
+		}),
+		Base: c.Client.Transport,
+	}
+
+	// setup cached values
+	c.statusG = util.ResettableCached(func() (zaptec.StateResponse, error) {
+		var res zaptec.StateResponse
+
+		uri := fmt.Sprintf("%s/api/chargers/%s/state", zaptec.ApiURL, c.instance.Id)
+		err := c.GetJSON(uri, &res)
+
+		return res, err
+	}, cache)
+
+	// Create a separate HTTP client for OAuth token requests to avoid circular dependency
+	// (c.Transport will be modified to use oauth2.Transport, which would create a loop)
+	tsCtx := context.WithValue(context.Background(), oauth2.HTTPClient, &http.Client{
+		Transport: c.Transport,
+	})
+
+	// Get shared token source for this user (per-user uniqueness)
+	ts, err := zaptec.TokenSource(tsCtx, user, password)
+	if err != nil {
+		return nil, err
+	}
+
+	c.Transport = &oauth2.Transport{
+		Source: ts,
+		Base:   c.Transport,
+	}
+
+	c.instance, err = ensureChargerEx(id, c.chargers, func(charger zaptec.Charger) (string, error) {
+		return charger.Id, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	c.version, err = c.detectVersion()
+	if err != nil {
+		return nil, err
+	}
+
+	inst, err := c.installation()
+	if err == nil || c.version == zaptec.ZaptecGo1_Pro {
+		implement.Has(c, implement.PhaseSwitcher(c.phases1p3p))
+	}
+
+	// the Zaptec Go 2 switches phases via the installation's per-phase available current;
+	// 1p->3p only works when all phases are set equal, so warn about an inconsistent setting
+	if err == nil && c.version == zaptec.ZaptecGo2 {
+		if p1, p2, p3 := inst.AvailableCurrentPhase1, inst.AvailableCurrentPhase2, inst.AvailableCurrentPhase3; p2 != p1 || p3 != p1 {
+			c.log.WARN.Printf("installation available current is unequal across phases (%.3gA/%.3gA/%.3gA); phase switching back to 3p requires available current on all phases", p1, p2, p3)
+		}
+	}
+
+	return c, nil
+}
+
+func (c *Zaptec) detectVersion() (int, error) {
+	var capabilities zaptec.CapabilitiesResponse
+
+	res, err := c.statusG.Get()
+	if err != nil {
+		return 0, err
+	}
+
+	capResp := res.ObservationByID(zaptec.Capabilities)
+	if err := json.Unmarshal([]byte(capResp.ValueAsString), &capabilities); err != nil {
+		return 0, err
+	}
+
+	if capabilities.ProductVariant == "Go2" {
+		return zaptec.ZaptecGo2, nil
+	}
+
+	return zaptec.ZaptecGo1_Pro, nil
+}
+
+func (c *Zaptec) chargers() ([]zaptec.Charger, error) {
+	var res zaptec.ChargersResponse
+
+	uri := fmt.Sprintf("%s/api/chargers", zaptec.ApiURL)
+	if err := c.GetJSON(uri, &res); err != nil {
+		return nil, err
+	}
+
+	return res.Data, nil
+}
+
+// Status implements the api.Charger interface
+func (c *Zaptec) Status() (api.ChargeStatus, error) {
+	res, err := c.statusG.Get()
+	if err != nil {
+		return api.StatusA, err
+	}
+	currentStatus, err := res.ObservationByID(zaptec.ChargerOperationMode).Int()
+	if err == nil && currentStatus == zaptec.OpModeDisconnected && currentStatus != c.lastStatus {
+		err = c.MaxCurrentMillis(0)
+	}
+	c.lastStatus = currentStatus
+
+	switch currentStatus {
+	case zaptec.OpModeDisconnected:
+		return api.StatusA, err
+	case zaptec.OpModeConnectedRequesting, zaptec.OpModeConnectedFinished:
+		return api.StatusB, err
+	case zaptec.OpModeConnectedCharging:
+		return api.StatusC, err
+	default:
+		if err == nil {
+			err = fmt.Errorf("unknown status: %d", currentStatus)
+		}
+		return api.StatusNone, err
+	}
+}
+
+// Enabled implements the api.Charger interface
+func (c *Zaptec) Enabled() (bool, error) {
+	res, err := c.statusG.Get()
+	return c.enabled && !res.ObservationByID(zaptec.FinalStopActive).Bool(), err
+}
+
+// Enable implements the api.Charger interface
+func (c *Zaptec) Enable(enable bool) error {
+	cmd := zaptec.CmdStopChargingFinal
+	if enable {
+		cmd = zaptec.CmdResumeCharging
+	}
+
+	uri := fmt.Sprintf("%s/api/chargers/%s/sendCommand/%d", zaptec.ApiURL, c.instance.Id, cmd)
+	req, _ := request.New(http.MethodPost, uri, nil, request.JSONEncoding)
+
+	var res struct {
+		Code int
+	}
+
+	// ignore 528: Charging is not Paused nor Scheduled; Resume command cannot be sent
+	if err := c.DoJSON(req, &res); err == nil || res.Code == 528 {
+		c.enabled = enable
+		c.statusG.Reset()
+	}
+
+	return nil
+}
+
+func (c *Zaptec) chargerUpdate(data zaptec.Update) error {
+	if c.passive {
+		if data.MaxChargeCurrent != nil || data.MinChargeCurrent != nil || data.OfflineChargeCurrent != nil {
+			c.log.DEBUG.Println("zaptec: passive mode: skipping chargerUpdate with current fields set")
+			return nil
+		}
+	}
+
+	uri := fmt.Sprintf("%s/api/chargers/%s/update", zaptec.ApiURL, c.instance.Id)
+
+	req, _ := request.New(http.MethodPost, uri, request.MarshalJSON(data), request.JSONEncoding)
+	_, err := c.DoBody(req)
+	if err == nil {
+		c.statusG.Reset()
+	}
+
+	return err
+}
+
+func (c *Zaptec) sessionPriority(session string, data zaptec.SessionPriority) error {
+	uri := fmt.Sprintf("%s/api/session/%s/priority", zaptec.ApiURL, session)
+
+	req, _ := request.New(http.MethodPost, uri, request.MarshalJSON(data), request.JSONEncoding)
+	_, err := c.DoBody(req)
+	if err == nil {
+		c.statusG.Reset()
+	}
+
+	return err
+}
+
+// MaxCurrent implements the api.Charger interface
+func (c *Zaptec) MaxCurrent(current int64) error {
+	return c.MaxCurrentMillis(float64(current))
+}
+
+var _ api.ChargerEx = (*Zaptec)(nil)
+
+// MaxCurrentMillis implements the api.ChargerEx interface
+func (c *Zaptec) MaxCurrentMillis(current float64) error {
+	current = math.Round(current*10) / 10
+	data := zaptec.Update{
+		MaxChargeCurrent: &current,
+	}
+
+	return c.chargerUpdate(data)
+}
+
+var _ api.Meter = (*Zaptec)(nil)
+
+// CurrentPower implements the api.Meter interface
+func (c *Zaptec) CurrentPower() (float64, error) {
+	res, err := c.statusG.Get()
+	if err != nil {
+		return 0, err
+	}
+
+	return res.ObservationByID(zaptec.TotalChargePower).Float64()
+}
+
+var _ api.ChargeRater = (*Zaptec)(nil)
+
+// ChargedEnergy implements the api.ChargeRater interface
+func (c *Zaptec) ChargedEnergy() (float64, error) {
+	res, err := c.statusG.Get()
+	if err != nil {
+		return 0, err
+	}
+
+	return res.ObservationByID(zaptec.TotalChargePowerSession).Float64()
+}
+
+var _ api.PhaseCurrents = (*Zaptec)(nil)
+
+// Currents implements the api.PhaseCurrents interface
+func (c *Zaptec) Currents() (float64, float64, float64, error) {
+	res, err := c.statusG.Get()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	var f [3]float64
+	for i, l := range []zaptec.ObservationID{zaptec.CurrentPhase1, zaptec.CurrentPhase2, zaptec.CurrentPhase3} {
+		if f[i], err = res.ObservationByID(l).Float64(); err != nil {
+			break
+		}
+	}
+
+	return f[0], f[1], f[2], err
+}
+
+// phases1p3p implements the api.PhaseSwitcher interface
+func (c *Zaptec) phases1p3p(phases int) error {
+	if err := c.switchPhases(phases); err != nil {
+		return err
+	}
+
+	res, err := c.statusG.Get()
+	if err != nil {
+		return err
+	}
+
+	if c.version == zaptec.ZaptecGo1_Pro {
+		// adjust the current by +/- 0.1A; otherwise, the phase change will not happen
+		current, err := res.ObservationByID(zaptec.ChargerMaxCurrent).Float64()
+		if err != nil {
+			return err
+		}
+
+		current -= 0.1
+		if current < 6 {
+			current += 0.2
+		}
+
+		if err := c.MaxCurrentMillis(current); err != nil {
+			return err
+		}
+	}
+
+	if !c.priority {
+		return nil
+	}
+
+	// priority configured
+	data := zaptec.SessionPriority{
+		PrioritizedPhases: &phases,
+	}
+
+	if session := res.ObservationByID(zaptec.SessionIdentifier); session != nil {
+		return c.sessionPriority(session.ValueAsString, data)
+	}
+
+	return errors.New("unknown session")
+}
+
+func (c *Zaptec) switchPhases(phases int) error {
+	if c.version == zaptec.ZaptecGo1_Pro {
+		data := zaptec.Update{
+			MaxChargePhases: &phases,
+		}
+
+		return c.chargerUpdate(data)
+	}
+
+	var phaseSwitchCurrent float64
+
+	if phases == 1 {
+		phaseSwitchCurrent = _ZaptecGo2PhaseSwitchCurrent
+	} else {
+		phaseSwitchCurrent = 0
+	}
+
+	data := zaptec.UpdateInstallation{
+		ThreeToOnePhaseSwitchCurrent: &phaseSwitchCurrent,
+	}
+	return c.installationUpdate(data)
+}
+
+var _ api.Identifier = (*Zaptec)(nil)
+
+// Identify implements the api.Identifier interface
+func (c *Zaptec) Identify() (string, error) {
+	res, err := c.statusG.Get()
+	if err != nil {
+		return "", err
+	}
+
+	if id := res.ObservationByID(zaptec.ChargerCurrentUserUuid); id != nil {
+		return id.ValueAsString, nil
+	}
+
+	return "", nil
+}
+
+func (c *Zaptec) installation() (zaptec.Installation, error) {
+	var res zaptec.Installation
+
+	uri := fmt.Sprintf("%s/api/installation/%s", zaptec.ApiURL, c.instance.InstallationId)
+	err := c.GetJSON(uri, &res)
+
+	return res, err
+}
+
+func (c *Zaptec) installationUpdate(data zaptec.UpdateInstallation) error {
+	uri := fmt.Sprintf("%s/api/installation/%s/update", zaptec.ApiURL, c.instance.InstallationId)
+
+	req, _ := request.New(http.MethodPost, uri, request.MarshalJSON(data), request.JSONEncoding)
+	_, err := c.DoBody(req)
+	if err == nil {
+		c.statusG.Reset()
+	}
+
+	return err
+}
+
+var _ api.Diagnosis = (*Zaptec)(nil)
+
+// Diagnosis implements the api.Diagnosis interface
+func (c *Zaptec) Diagnose() {
+	res, _ := c.statusG.Get()
+
+	// sort for printing
+	sort.Slice(res, func(i, j int) bool {
+		return res[i].StateId < res[j].StateId
+	})
+
+	for _, k := range res {
+		fmt.Printf("%d. %s %s\n", k.StateId, k.StateId, k)
+	}
+}

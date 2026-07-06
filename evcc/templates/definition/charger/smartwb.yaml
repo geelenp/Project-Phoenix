@@ -1,0 +1,15 @@
+template: smartwb
+products:
+  - description:
+      generic: smartWB
+capabilities: ["meter", "dim"]
+params:
+  - name: host
+render: |
+  type: evsewifi
+  uri: http://{{ .host }}
+  meter:
+    power: true
+    energy: true
+    currents: true
+    voltages: true

@@ -1,0 +1,442 @@
+package charger
+
+// LICENSE
+
+// Copyright (c) evcc.io (andig, naltatis, premultiply)
+
+// This module is NOT covered by the MIT license. All rights reserved.
+
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"slices"
+	"time"
+
+	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/api/implement"
+	"github.com/evcc-io/evcc/charger/ocpp"
+	"github.com/evcc-io/evcc/util"
+	"github.com/evcc-io/evcc/util/sponsor"
+	"github.com/lorenzodonini/ocpp-go/ocpp1.6/core"
+	"github.com/lorenzodonini/ocpp-go/ocpp1.6/types"
+)
+
+// OCPP charger implementation
+type OCPP struct {
+	implement.Caps
+	cp      *ocpp.CP
+	conn    *ocpp.Connector
+	phases  int
+	enabled bool
+	current float64
+
+	stackLevelZero      bool
+	profileKindRelative bool
+}
+
+const defaultIdTag = "evcc" // RemoteStartTransaction only
+
+func init() {
+	registry.AddCtx("ocpp", NewOCPPFromConfig)
+}
+
+// NewOCPPFromConfig creates a OCPP charger from generic config
+func NewOCPPFromConfig(ctx context.Context, other map[string]any) (api.Charger, error) {
+	cc := struct {
+		StationId      string
+		IdTag          string
+		Connector      int
+		MeterInterval  time.Duration
+		MeterValues    string
+		ConnectTimeout time.Duration // Initial Timeout
+
+		Timeout          time.Duration              // TODO deprecated
+		BootNotification *bool                      // TODO deprecated
+		GetConfiguration *bool                      // TODO deprecated
+		ChargingRateUnit types.ChargingRateUnitType // TODO deprecated
+		AutoStart        bool                       // TODO deprecated
+		NoStop           bool                       // TODO deprecated
+
+		ForcePowerCtrl       bool
+		StackLevelZero       *bool
+		ProfileKindRelative  bool
+		RemoteStart          bool
+		NoChangeAvailability *bool
+	}{
+		Connector:      1,
+		MeterInterval:  10 * time.Second,
+		ConnectTimeout: 5 * time.Minute,
+	}
+
+	if err := util.DecodeOther(other, &cc); err != nil {
+		return nil, err
+	}
+
+	stackLevelZero := cc.StackLevelZero != nil && *cc.StackLevelZero
+	profileKindRelative := cc.ProfileKindRelative
+	noChangeAvailability := cc.NoChangeAvailability != nil && *cc.NoChangeAvailability
+
+	c, err := NewOCPP(ctx,
+		cc.StationId, cc.Connector, cc.IdTag,
+		cc.MeterValues, cc.MeterInterval,
+		cc.ForcePowerCtrl, stackLevelZero, profileKindRelative, cc.RemoteStart, noChangeAvailability,
+		cc.ConnectTimeout)
+	if err != nil {
+		return c, err
+	}
+
+	if !sponsor.IsAuthorized() {
+		return nil, api.ErrSponsorRequired
+	}
+
+	if c.cp.HasMeasurement(types.MeasurandPowerActiveImport) {
+		implement.Has(c, implement.Meter(c.conn.CurrentPower))
+	}
+
+	if c.cp.HasMeasurement(types.MeasurandEnergyActiveImportRegister) {
+		implement.Has(c, implement.MeterEnergy(c.conn.TotalEnergy))
+	}
+
+	if c.cp.HasMeasurement(types.MeasurandCurrentImport) {
+		implement.Has(c, implement.PhaseCurrents(c.conn.Currents))
+	}
+
+	if c.cp.HasMeasurement(types.MeasurandVoltage) {
+		implement.Has(c, implement.PhaseVoltages(c.conn.Voltages))
+	}
+
+	if c.cp.HasMeasurement(types.MeasurandSoC) {
+		implement.Has(c, implement.Battery(c.conn.Soc))
+	}
+
+	if c.cp.PhaseSwitching {
+		implement.Has(c, implement.PhaseSwitcher(c.phases1p3p))
+	}
+
+	return c, nil
+}
+
+// NewOCPP creates OCPP charger
+func NewOCPP(ctx context.Context,
+	id string, connector int, idTag string,
+	meterValues string, meterInterval time.Duration,
+	forcePowerCtrl, stackLevelZero, profileKindRelative, remoteStart, noChangeAvailability bool,
+	connectTimeout time.Duration,
+) (*OCPP, error) {
+	log := util.NewLogger(fmt.Sprintf("%s-%d", cmp.Or(id, "ocpp"), connector))
+
+	cs, err := ocpp.Instance()
+	if err != nil {
+		return nil, err
+	}
+
+	cp, err := cs.RegisterChargepoint(id,
+		func() *ocpp.CP {
+			return ocpp.NewChargePoint(log, cs, id)
+		},
+		func(cp *ocpp.CP) error {
+			log.DEBUG.Printf("waiting for chargepoint: %v", connectTimeout)
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(connectTimeout):
+				return api.ErrTimeout
+			case <-cp.HasConnected():
+			}
+
+			return cp.Setup(ctx, meterValues, meterInterval, forcePowerCtrl, noChangeAvailability)
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if cp.NumberOfConnectors > 0 && connector > cp.NumberOfConnectors {
+		return nil, fmt.Errorf("invalid connector: %d", connector)
+	}
+
+	if remoteStart {
+		idTag = cmp.Or(idTag, cp.IdTag, defaultIdTag)
+	}
+
+	conn, err := ocpp.NewConnector(ctx, log, connector, cp, idTag, meterInterval)
+	if err != nil {
+		return nil, err
+	}
+
+	c := &OCPP{
+		Caps:                implement.New(),
+		cp:                  cp,
+		conn:                conn,
+		stackLevelZero:      stackLevelZero,
+		profileKindRelative: profileKindRelative,
+	}
+
+	if cp.HasRemoteTriggerFeature {
+		go conn.WatchDog(ctx, meterInterval)
+	}
+
+	// monitor for charger reboots and re-run setup (once per CP, not per connector)
+	cp.MonitorReboot(ctx, func() error {
+		return c.cp.Setup(ctx, meterValues, meterInterval, forcePowerCtrl, noChangeAvailability)
+	})
+
+	return c, conn.Initialized()
+}
+
+// Connector returns the connector instance
+func (c *OCPP) Connector() *ocpp.Connector {
+	return c.conn
+}
+
+// Status implements the api.Charger interface
+func (c *OCPP) Status() (api.ChargeStatus, error) {
+	status, err := c.conn.Status()
+	if err != nil {
+		return api.StatusNone, err
+	}
+
+	switch status {
+	case
+		core.ChargePointStatusAvailable,   // "Available"
+		core.ChargePointStatusUnavailable: // "Unavailable"
+		return api.StatusA, nil
+	case
+		core.ChargePointStatusPreparing,     // "Preparing"
+		core.ChargePointStatusSuspendedEVSE, // "SuspendedEVSE"
+		core.ChargePointStatusSuspendedEV,   // "SuspendedEV"
+		core.ChargePointStatusFinishing:     // "Finishing"
+		return api.StatusB, nil
+	case
+		core.ChargePointStatusCharging: // "Charging"
+		return api.StatusC, nil
+	default:
+		return api.StatusNone, fmt.Errorf("invalid status: %s", status)
+	}
+}
+
+var _ api.StatusReasoner = (*OCPP)(nil)
+
+func (c *OCPP) StatusReason() (api.Reason, error) {
+	var res api.Reason
+
+	s, err := c.conn.Status()
+	if err != nil {
+		return res, err
+	}
+
+	switch {
+	case c.conn.NeedsAuthentication():
+		res = api.ReasonWaitingForAuthorization
+
+	case s == core.ChargePointStatusFinishing:
+		res = api.ReasonDisconnectRequired
+	}
+
+	return res, nil
+}
+
+// Enabled implements the api.Charger interface
+func (c *OCPP) Enabled() (bool, error) {
+	if s, err := c.conn.Status(); err == nil {
+		switch s {
+		case
+			core.ChargePointStatusSuspendedEVSE:
+			return false, nil
+		case
+			core.ChargePointStatusCharging,
+			core.ChargePointStatusSuspendedEV:
+			return true, nil
+		}
+	}
+
+	// fallback to the "offered" measurands
+	if c.cp.HasMeasurement(types.MeasurandCurrentOffered) {
+		if v, err := c.conn.GetMaxCurrent(); err == nil {
+			return v > 0, nil
+		}
+	}
+	if c.cp.HasMeasurement(types.MeasurandPowerOffered) {
+		if v, err := c.conn.GetMaxPower(); err == nil {
+			return v > 0, nil
+		}
+	}
+
+	// fallback to querying the active charging profile schedule limit
+	if v, err := c.conn.GetScheduleLimit(60); err == nil {
+		return v > 0, nil
+	}
+
+	// fallback to cached value as last resort
+	return c.enabled, nil
+}
+
+// Enable implements the api.Charger interface
+func (c *OCPP) Enable(enable bool) error {
+	var current float64
+	if enable {
+		current = c.current
+	}
+
+	err := c.setCurrent(current)
+	if err == nil {
+		// cache enabled state as last fallback option
+		c.enabled = enable
+	}
+
+	return err
+}
+
+// setCurrent sets the TxDefaultChargingProfile with given current
+func (c *OCPP) setCurrent(current float64) error {
+	err := c.conn.SetChargingProfileRequest(c.createTxDefaultChargingProfile(math.Trunc(10*current) / 10))
+	if err != nil {
+		err = fmt.Errorf("set charging profile: %w", err)
+	}
+
+	return err
+}
+
+// createTxDefaultChargingProfile returns a TxDefaultChargingProfile with given current
+func (c *OCPP) createTxDefaultChargingProfile(current float64) *types.ChargingProfile {
+	phases := c.phases
+	period := types.NewChargingSchedulePeriod(0, current)
+
+	if c.cp.ChargingRateUnit == types.ChargingRateUnitWatts {
+		period = types.NewChargingSchedulePeriod(0, math.Trunc(230.0*current*float64(phases)))
+	} else {
+		// OCPP assumes phases == 3 if not set
+		if phases != 0 {
+			// set explicit phase configuration
+			period.NumberPhases = &phases
+		}
+	}
+
+	res := &types.ChargingProfile{
+		ChargingProfileId:      c.cp.ChargingProfileId,
+		ChargingProfilePurpose: types.ChargingProfilePurposeTxDefaultProfile,
+		ChargingSchedule: &types.ChargingSchedule{
+			ChargingRateUnit:       c.cp.ChargingRateUnit,
+			ChargingSchedulePeriod: []types.ChargingSchedulePeriod{period},
+		},
+	}
+
+	if c.profileKindRelative {
+		res.ChargingProfileKind = types.ChargingProfileKindRelative
+	} else {
+		res.ChargingProfileKind = types.ChargingProfileKindAbsolute
+		res.ChargingSchedule.StartSchedule = types.NewDateTime(time.Now().Add(-time.Minute))
+	}
+
+	if !c.stackLevelZero {
+		res.StackLevel = c.cp.StackLevel
+	}
+
+	return res
+}
+
+var _ api.CurrentGetter = (*OCPP)(nil)
+
+// GetMaxCurrent returns the current the charge point is set to offer.
+// Prefers the Current.Offered measurand, falls back to the last confirmed charging profile limit.
+func (c *OCPP) GetMaxCurrent() (float64, error) {
+	if c.cp.HasMeasurement(types.MeasurandCurrentOffered) {
+		if v, err := c.conn.GetMaxCurrent(); err == nil || !errors.Is(err, api.ErrNotAvailable) {
+			return v, err
+		}
+	}
+
+	if c.current > 0 {
+		return c.current, nil
+	}
+
+	return 0, api.ErrNotAvailable
+}
+
+// MaxCurrent implements the api.Charger interface
+func (c *OCPP) MaxCurrent(current int64) error {
+	return c.MaxCurrentMillis(float64(current))
+}
+
+var _ api.ChargerEx = (*OCPP)(nil)
+
+// MaxCurrentMillis implements the api.ChargerEx interface
+func (c *OCPP) MaxCurrentMillis(current float64) error {
+	err := c.setCurrent(current)
+	if err == nil {
+		c.current = current
+	}
+	return err
+}
+
+// phases1p3p implements the api.PhaseSwitcher interface
+func (c *OCPP) phases1p3p(phases int) error {
+	c.phases = phases
+
+	enabled, err := c.Enabled()
+	if err != nil {
+		return err
+	}
+
+	var current float64
+	if enabled {
+		current = c.current
+	}
+
+	return c.setCurrent(current)
+}
+
+var _ api.Identifier = (*OCPP)(nil)
+
+// Identify implements the api.Identifier interface
+func (c *OCPP) Identify() (string, error) {
+	return c.conn.IdTag(), nil
+}
+
+var _ api.Diagnosis = (*OCPP)(nil)
+
+// Diagnose implements the api.Diagnosis interface
+func (c *OCPP) Diagnose() {
+	fmt.Printf("\tCharge Point ID: %s\n", c.cp.ID())
+
+	if c.cp.BootNotificationResult != nil {
+		fmt.Printf("\tBoot Notification:\n")
+		fmt.Printf("\t\tChargePointVendor: %s\n", c.cp.BootNotificationResult.ChargePointVendor)
+		fmt.Printf("\t\tChargePointModel: %s\n", c.cp.BootNotificationResult.ChargePointModel)
+		fmt.Printf("\t\tChargePointSerialNumber: %s\n", c.cp.BootNotificationResult.ChargePointSerialNumber)
+		fmt.Printf("\t\tFirmwareVersion: %s\n", c.cp.BootNotificationResult.FirmwareVersion)
+	}
+
+	fmt.Printf("\tConfiguration:\n")
+	if resp, err := c.cp.GetConfigurationRequest(); err == nil {
+		// sort configuration keys for printing
+		slices.SortFunc(resp.ConfigurationKey, func(i, j core.ConfigurationKey) int {
+			return cmp.Compare(i.Key, j.Key)
+		})
+
+		rw := map[bool]string{false: "r/w", true: "r/o"}
+
+		for _, opt := range resp.ConfigurationKey {
+			if opt.Value == nil {
+				continue
+			}
+
+			fmt.Printf("\t\t%s (%s): %s\n", opt.Key, rw[opt.Readonly], *opt.Value)
+		}
+	}
+}
