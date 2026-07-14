@@ -1,67 +1,26 @@
 from phoenix.core.state import PhoenixState
-from phoenix.core.validator import PhoenixValidator
+from phoenix.planner.context import DecisionContext
+from phoenix.planner.planner import Planner
 
 
 class PhoenixEngine:
     """
-    Coordinates the Phoenix core.
+    Central EMS engine.
 
-    Responsibilities:
-    - update PhoenixState
-    - validate state
-    - expose a stable state for future planner execution
-
-    Planner, Forecast and Outputs will be added later.
+    Converts PhoenixState into a DecisionContext,
+    executes the planner and returns a Plan.
     """
 
     def __init__(self):
-        self.state = PhoenixState()
-        self.validator = PhoenixValidator()
+        self.planner = Planner()
 
-    def process(self, event: dict):
-        if not event:
-            return
-
-        #
-        # Ignore forecast updates for now
-        #
-
-        if any(key.startswith("forecast.") for key in event):
-            return
-
-        #
-        # Ignore evcc log messages
-        #
-
-        if "log" in event:
-            level = event["log"].get("level", "info").upper()
-            message = event["log"].get("message", "")
-
-            print(f"[{level}] {message}")
-            return
-
-        #
-        # Update state
-        #
-
-        self.state.update(event)
-
-        #
-        # Validate
-        #
-
-        warnings = self.validator.validate(self.state)
-
-        #
-        # Temporary console output
-        #
-
-        print(
-            f"Grid={self.state.grid_power} W | "
-            f"Home={self.state.home_power} W | "
-            f"PV={self.state.pv_power} W | "
-            f"Battery={self.state.battery_soc}%"
+    def run(self, state: PhoenixState):
+        context = DecisionContext(
+            car_connected=state.car_connected,
+            car_charging=state.car_charging,
+            grid_power=state.grid_power,
+            pv_power=state.pv_power,
+            battery_soc=state.battery_soc,
         )
 
-        for warning in warnings:
-            print(f"WARNING: {warning}")
+        return self.planner.create_plan(context)

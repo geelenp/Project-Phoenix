@@ -1,12 +1,11 @@
 from dataclasses import dataclass
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class Plan:
     """
-    Result produced by the Phoenix Planner.
+    Result produced by the Phoenix planner.
     """
 
-    mode: str = "idle"
-    reason: str = ""
-    charge_power: int = 0
+    mode: str
+    reason: str

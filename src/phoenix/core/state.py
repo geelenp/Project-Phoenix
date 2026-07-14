@@ -116,11 +116,42 @@ class PhoenixState:
 
     def _merge(self, target, source):
         for key, value in source.items():
+
+            #
+            # Merge dictionaries
+            #
+
             if (
                 key in target
                 and isinstance(target[key], dict)
                 and isinstance(value, dict)
             ):
                 self._merge(target[key], value)
+
+            #
+            # Merge lists of dictionaries
+            #
+
+            elif (
+                key in target
+                and isinstance(target[key], list)
+                and isinstance(value, list)
+            ):
+                while len(target[key]) < len(value):
+                    target[key].append({})
+
+                for i, item in enumerate(value):
+                    if (
+                        isinstance(target[key][i], dict)
+                        and isinstance(item, dict)
+                    ):
+                        self._merge(target[key][i], item)
+                    else:
+                        target[key][i] = item
+
+            #
+            # Replace everything else
+            #
+
             else:
                 target[key] = value

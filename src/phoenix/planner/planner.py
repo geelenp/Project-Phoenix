@@ -1,3 +1,4 @@
+from phoenix.planner.context import DecisionContext
 from phoenix.planner.plan import Plan
 
 
@@ -5,44 +6,28 @@ class Planner:
     """
     Phoenix EMS planner.
 
-    The planner is stateless.
-
-    Input:
-        PhoenixState
-
-    Output:
-        Plan
+    Stateless.
+    Receives a DecisionContext.
+    Returns a Plan.
     """
 
-    def create_plan(self, state):
+    def create_plan(self, context: DecisionContext) -> Plan:
+
         #
         # No EV connected
         #
 
-        if not state.data.get("car", {}).get("connected", False):
+        if not context.car_connected:
             return Plan(
                 mode="idle",
                 reason="No EV connected",
-                charge_power=0,
             )
 
         #
-        # Fast charging requested
-        #
-
-        if state.data.get("car", {}).get("fast_requested", False):
-            return Plan(
-                mode="fast",
-                reason="Fast charging requested",
-                charge_power=99999,
-            )
-
-        #
-        # Default
+        # EV connected
         #
 
         return Plan(
             mode="smart",
-            reason="Normal EMS operation",
-            charge_power=0,
+            reason="EV connected",
         )
