@@ -1,7 +1,5 @@
 from copy import deepcopy
 
-from phoenix.core.derived import DerivedState
-
 
 class PhoenixState:
     """
@@ -15,7 +13,6 @@ class PhoenixState:
 
     def __init__(self):
         self.data = {}
-        self.derived = DerivedState(self)
 
     def update(self, event: dict):
         self._merge(self.data, event)
@@ -35,6 +32,14 @@ class PhoenixState:
     def grid_energy(self):
         return self.data.get("grid", {}).get("energy")
 
+    @property
+    def importing(self):
+        return (self.grid_power or 0) > 0
+
+    @property
+    def exporting(self):
+        return (self.grid_power or 0) < 0
+
     #
     # Home
     #
@@ -50,6 +55,10 @@ class PhoenixState:
     @property
     def pv_power(self):
         return self.data.get("pvPower")
+
+    @property
+    def pv_energy(self):
+        return self.data.get("pvEnergy")
 
     #
     # Battery
@@ -67,6 +76,28 @@ class PhoenixState:
     def battery_capacity(self):
         return self.data.get("battery", {}).get("capacity")
 
+    @property
+    def battery_energy(self):
+        return self.data.get("battery", {}).get("energy")
+
+    #
+    # EV
+    #
+
+    @property
+    def car_connected(self):
+        loadpoints = self.data.get("loadpoints", [])
+        if not loadpoints:
+            return False
+        return loadpoints[0].get("connected", False)
+
+    @property
+    def car_charging(self):
+        loadpoints = self.data.get("loadpoints", [])
+        if not loadpoints:
+            return False
+        return loadpoints[0].get("charging", False)
+
     #
     # Diagnostics
     #
@@ -82,10 +113,6 @@ class PhoenixState:
     @property
     def site_title(self):
         return self.data.get("siteTitle")
-
-    #
-    # Internal
-    #
 
     def _merge(self, target, source):
         for key, value in source.items():
