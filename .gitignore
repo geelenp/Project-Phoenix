@@ -13,3 +13,17 @@ __pycache__/
 
 # Research (geen onderdeel van Phoenix)
 sunny/
+
+# Tesla authentication
+tools/tesla/config.py
+tools/tesla/tokens.json
+tools/tesla/keys/
+
+# Solcast
+tools/solcast/config.py
+
+# ENTSO-E
+tools/entsoe/config.py
+
+# SDM120M
+tools/sdm120m/config.py

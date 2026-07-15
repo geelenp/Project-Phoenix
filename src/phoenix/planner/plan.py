@@ -4,8 +4,8 @@ from dataclasses import dataclass
 @dataclass(slots=True, frozen=True)
 class Plan:
     """
-    Result produced by the Phoenix planner.
+    Decision produced by the planner.
     """
 
-    mode: str
+    charge: bool
     reason: str

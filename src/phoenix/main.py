@@ -15,12 +15,7 @@ async def handle_event(event: dict):
 
     normalized = EventNormalizer.normalize(event)
 
-    print(event)
-    print(normalized)
-
     state.update(normalized)
-
-    print(state.data.get("loadpoints"))
 
     plan = engine.run(state)
 
@@ -31,7 +26,7 @@ async def handle_event(event: dict):
         f"Battery={state.battery_soc:>3}% | "
         f"EV={'Connected' if state.car_connected else 'Disconnected'} | "
         f"{'Charging' if state.car_charging else 'Idle'} | "
-        f"Plan={plan.mode}"
+        f"Charge={'ON' if plan.charge else 'OFF'}"
     )
 
     warnings = validator.validate(state)
