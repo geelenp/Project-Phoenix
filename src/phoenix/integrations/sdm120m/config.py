@@ -1,0 +1,5 @@
+PORT = "/dev/ttyUSB0"
+
+SLAVE_ID = 1
+
+BAUDRATE = 9600
