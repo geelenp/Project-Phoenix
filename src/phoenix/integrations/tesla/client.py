@@ -1,30 +1,47 @@
+"""
+Project Phoenix
+
+Tesla Fleet API client.
+"""
+
 import requests
+
+from .auth import get_access_token
+from .config import BASE_URL
 
 
 class TeslaClient:
-    """
-    Minimal Tesla Fleet API client.
 
-    At this stage the client only performs
-    authenticated GET requests.
-    """
+    def __init__(self):
 
-    def __init__(self, access_token: str):
-
-        self.access_token = access_token
-
-        self.base_url = "https://fleet-api.prd.eu.vn.cloud.tesla.com/api/1"
+        self.base_url = BASE_URL
 
     def get(self, endpoint: str):
 
         response = requests.get(
             f"{self.base_url}/{endpoint}",
-            headers={
-                "Authorization": f"Bearer {self.access_token}"
-            },
+            headers=self._headers(),
             timeout=30,
         )
 
         response.raise_for_status()
 
         return response.json()
+
+    def post(self, endpoint: str):
+
+        response = requests.post(
+            f"{self.base_url}/{endpoint}",
+            headers=self._headers(),
+            timeout=30,
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+    def _headers(self):
+
+        return {
+            "Authorization": f"Bearer {get_access_token()}",
+        }

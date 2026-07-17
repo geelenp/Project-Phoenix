@@ -1,7 +1,6 @@
 from pymodbus.client import ModbusTcpClient
 
-from config import HOST, PORT, UNIT
-
+from .config import HOST, PORT, UNIT
 
 class EChargerClient:
 

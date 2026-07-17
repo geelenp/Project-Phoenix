@@ -2,8 +2,7 @@ import time
 
 from pymodbus.client import ModbusTcpClient
 
-from config import HOST, PORT, UNIT
-
+from .config import HOST, PORT, UNIT
 
 MAX_RETRIES = 10
 RETRY_DELAY = 2
