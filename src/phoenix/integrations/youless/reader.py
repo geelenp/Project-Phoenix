@@ -20,7 +20,7 @@ def read():
 
     return {
         "generated": datetime.now(UTC),
-        "power_kw": data["pwr"] / 1000.0,
+        "power": data["pwr"],
         "energy_import_kwh": data["p1"] + data["p2"],
         "energy_export_kwh": data["n1"] + data["n2"],
         "gas_m3": data["gas"],

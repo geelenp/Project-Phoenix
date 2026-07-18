@@ -4,6 +4,8 @@ Project Phoenix
 SMA eCharger reader.
 """
 
+from datetime import UTC, datetime
+
 from .client import EChargerClient
 from . import registers as reg
 
@@ -29,6 +31,12 @@ def read():
         data = {
 
             #
+            # Metadata
+            #
+
+            "generated": datetime.now(UTC),
+
+            #
             # Device information
             #
 
@@ -50,7 +58,7 @@ def read():
             "max_power": read_register(reg.MAX_POWER),
 
             #
-            # Active Power
+            # Active power
             #
 
             "power_l1": read_register(reg.POWER_L1),
@@ -58,7 +66,7 @@ def read():
             "power_l3": read_register(reg.POWER_L3),
 
             #
-            # Grid Voltage (FIX2)
+            # Grid voltage
             #
 
             "voltage_l1": None,
@@ -66,7 +74,7 @@ def read():
             "voltage_l3": None,
 
             #
-            # Reactive Power
+            # Reactive power
             #
 
             "reactive_total": read_register(reg.REACTIVE_TOTAL),
@@ -75,7 +83,7 @@ def read():
             "reactive_l3": read_register(reg.REACTIVE_L3),
 
             #
-            # Apparent Power
+            # Apparent power
             #
 
             "apparent_total": read_register(reg.APPARENT_TOTAL),
@@ -84,10 +92,10 @@ def read():
             "apparent_l3": read_register(reg.APPARENT_L3),
 
             #
-            # Total Active Power
+            # Total active power
             #
 
-            "power_total_register": read_register(reg.TOTAL_ACTIVE_POWER),
+            "power_register": read_register(reg.TOTAL_ACTIVE_POWER),
         }
 
         value = read_register(reg.VOLTAGE_L1)
@@ -109,17 +117,16 @@ def read():
         ]
 
         if None not in powers:
-            data["power_total_calculated"] = sum(powers)
+            power_calculated = sum(powers)
         else:
-            data["power_total_calculated"] = None
+            power_calculated = None
 
-        if data["power_total_register"] is not None:
-            data["power_total"] = data["power_total_register"]
+        if data["power_register"] is not None:
+            data["power"] = data["power_register"]
         else:
-            data["power_total"] = data["power_total_calculated"]
+            data["power"] = power_calculated
 
-        del data["power_total_register"]
-        del data["power_total_calculated"]
+        del data["power_register"]
 
         return data
 

@@ -1,52 +1,38 @@
 """
 Project Phoenix
-
-Energy Management System
 """
 
 from pprint import pprint
+from time import sleep
 
+from phoenix.adapters.manager import AdapterManager
 from phoenix.energy.calculate import calculate
+from phoenix.energy.context import create_context
+from phoenix.energy.planner import create_plan
 from phoenix.energy.state import create_state
-
-from phoenix.integrations.youless.reader import read as read_grid
-from phoenix.integrations.sbs.reader import read as read_battery
-from phoenix.integrations.echarger.reader import read as read_charger
-from phoenix.integrations.tesla.reader import read as read_vehicle
-from phoenix.integrations.sdm120m.reader import read as read_pv
-from phoenix.integrations.solcast.reader import read as read_forecast
-from phoenix.integrations.entsoe.reader import read as read_prices
-
-
-def safe_read(name, reader):
-
-    try:
-        return reader()
-
-    except Exception as e:
-
-        print(f"{name}: {e}")
-
-        return None
 
 
 def main():
 
     state = create_state()
 
-    state["grid"] = safe_read("Grid", read_grid)
-    state["battery"] = safe_read("Battery", read_battery)
-    state["charger"] = safe_read("Charger", read_charger)
-    state["vehicle"] = safe_read("Tesla", read_vehicle)
-    state["pv"] = safe_read("PV", read_pv)
-    state["forecast"] = safe_read("Solcast", read_forecast)
-    state["prices"] = safe_read("ENTSO-E", read_prices)
+    adapters = AdapterManager()
 
-    state = calculate(state)
+    while True:
 
-    print()
-    pprint(state)
-    print()
+        state = adapters.update(state)
+
+        state = calculate(state)
+
+        context = create_context(state)
+
+        plan = create_plan(state, context)
+
+        pprint(state)
+        pprint(context)
+        pprint(plan)
+
+        sleep(1)
 
 
 if __name__ == "__main__":

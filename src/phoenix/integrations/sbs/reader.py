@@ -17,9 +17,9 @@ def read():
         return {
             "generated": datetime.now(UTC),
             "soc": client.read_u32(30845),
-            "power_kw": client.read_s32(30775) / 1000.0,
-            "current_a": client.read_s32(30843),
-            "voltage_v": client.read_u32(30851) / 100.0,
+            "power": client.read_s32(30775),
+            "current": client.read_s32(30843),
+            "voltage": client.read_u32(30851) / 100.0,
         }
     finally:
         client.close()

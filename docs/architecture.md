@@ -1,131 +1,148 @@
 # Project Phoenix - Architecture
 
-## Philosophy
+## Doel
 
-Project Phoenix is not built around hardware.
+Project Phoenix is een lokaal Energy Management System (EMS) dat het energieverbruik van een woning optimaliseert.
 
-It is built around an energy policy.
-
-Hardware may change over time, but the policy remains the same.
-
-The goal is to maximize self-consumption while respecting a clear set of priorities defined by the user.
+Phoenix verzamelt gegevens uit verschillende bronnen, berekent de actuele energietoestand en neemt vervolgens beslissingen om toestellen aan te sturen.
 
 ---
 
-# Core Principles
-
-## 1. One Source of Truth
-
-Every domain has exactly one primary data source.
-
-| Domain           | Source of Truth |
-| ---------------- | --------------- |
-| Grid             | YouLess (P1)    |
-| Home Battery     | SMA SBS 5.0     |
-| Electric Vehicle | Tesla Fleet API |
-| EV Charger       | SMA eCharger    |
-| Dynamic Prices   | Ecopower        |
-| PV Forecast      | Solcast         |
-
----
-
-## 2. Separation of Responsibilities
-
-The system is divided into four independent layers.
+## Architectuuroverzicht
 
 ```
-Data Providers
-        │
-        ▼
-World Model
-        │
-        ▼
-Policy Engine
-        │
-        ▼
-Execution Layer (EVCC)
+                PHOENIX
+                   │
+          Adapter Manager
+                   │
+              Readers
+                   │
+            Energy State
+                   │
+         Decision Context
+                   │
+              Planner
+                   │
+              Executor
+                   │
+             Actuators
 ```
 
-### Data Providers
+---
 
-Collect information.
+## Componenten
 
-They never make decisions.
+### Phoenix
 
-### World Model
+Phoenix bestuurt de volledige applicatie.
 
-Represents the current state of the house.
+Verantwoordelijkheden:
 
-Examples:
+- starten van het systeem
+- uitvoeren van de hoofdloop
+- aanroepen van de verschillende componenten
 
-* Grid importing
-* PV surplus
-* Battery satisfied
-* EV connected
-* Fast charging requested
-
-### Policy Engine
-
-Decides what should happen.
-
-It contains the energy strategy.
-
-### Execution Layer
-
-Executes decisions.
-
-Project Phoenix currently uses EVCC for this purpose.
+Phoenix bevat geen businesslogica.
 
 ---
 
-# Priority Order
+### Adapter Manager
 
-Project Phoenix follows a fixed priority hierarchy.
+De Adapter Manager vormt de brug tussen Phoenix en alle externe databronnen.
 
-1. Safety
-2. Home battery
-3. User intention
-4. Self consumption
-5. Economic optimisation
+Verantwoordelijkheden:
 
-Electricity price is only one parameter.
+- registreren van readers
+- bepalen wanneer een reader uitgevoerd wordt
+- readers uitvoeren
+- fouten afhandelen
 
-It never overrides higher priorities.
-
----
-
-# User Intent
-
-Explicit user actions may temporarily modify the strategy.
-
-Examples:
-
-* Fast charging
-* Maintenance mode
-* Test mode
-
-These actions are intentional overrides.
-
-They are not automatic optimisations.
+De Adapter Manager bewaart zelf geen meetgegevens.
 
 ---
 
-# Reliability
+### Readers
 
-Project Phoenix assumes that communication with the SMA SBS 5.0 may temporarily fail.
+Elke integratie bevat een reader.
 
-The system therefore distinguishes between:
+Een reader:
 
-* Valid data
-* Stale data
-* Invalid data
+- leest precies één externe databron
+- vertaalt de gegevens naar een standaard Python dictionary
+- bevat geen businesslogica
+- is stateless
 
-Energy decisions that depend on battery information are only taken when battery data is considered reliable.
+Elke integratie bestaat uit:
+
+```
+config.py
+client.py
+reader.py
+```
 
 ---
 
-# Motto
+### Energy State
 
-> Data tells us what **is**.
->
-> Policy decides what we **do**.
+De Energy State is de Single Source of Truth van Phoenix.
+
+Alle actuele gegevens bevinden zich hier.
+
+Bij een succesvolle polling worden gegevens bijgewerkt.
+
+Bij een pollingfout blijft de vorige geldige waarde behouden.
+
+Elke dataset bevat een timestamp zodat latere componenten kunnen bepalen hoe oud de informatie is.
+
+---
+
+### Decision Context
+
+De Decision Context vertaalt de ruwe Energy State naar informatie waarop beslissingen genomen kunnen worden.
+
+Voorbeelden:
+
+- overschot PV
+- goedkoop laden
+- voertuig aangesloten
+- batterij bijna vol
+
+---
+
+### Planner
+
+De Planner bepaalt wat Phoenix wil doen.
+
+Hij bevat uitsluitend beslissingslogica.
+
+De Planner stuurt geen hardware rechtstreeks aan.
+
+---
+
+### Executor
+
+De Executor vertaalt een plan naar concrete acties.
+
+Bijvoorbeeld:
+
+- laadstroom wijzigen
+- batterij laden
+- batterij ontladen
+
+---
+
+### Actuators
+
+Actuators communiceren met de fysieke apparaten.
+
+Ze voeren uitsluitend opdrachten uit.
+
+---
+
+## Ontwerpprincipes
+
+- Energy State is de Single Source of Truth.
+- Readers zijn stateless.
+- Elke component heeft één duidelijke verantwoordelijkheid.
+- Businesslogica bevindt zich uitsluitend in de Planner.
+- Hardwarekennis blijft beperkt tot Readers en Actuators.

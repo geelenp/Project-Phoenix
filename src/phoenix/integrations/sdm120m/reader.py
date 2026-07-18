@@ -45,8 +45,8 @@ def read():
 
     return {
         "generated": datetime.now(UTC),
-        "power_kw": power / 1000.0,
-        "voltage_v": voltage,
-        "current_a": current,
+        "power": int(round(power)),
+        "voltage": voltage,
+        "current": current,
         "energy_total_kwh": energy,
     }
