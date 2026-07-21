@@ -10,6 +10,7 @@ from phoenix.energy.calculate import calculate
 from phoenix.energy.context import create_context
 from phoenix.energy.planner import create_plan
 from phoenix.energy.state import create_state
+from phoenix.energy.targets import create_targets
 
 
 def main():
@@ -26,10 +27,13 @@ def main():
 
         context = create_context(state)
 
-        plan = create_plan(state, context)
+        targets = create_targets(state, context)
+
+        plan = create_plan(state, context, targets)
 
         pprint(state)
         pprint(context)
+        pprint(targets)
         pprint(plan)
 
         sleep(1)

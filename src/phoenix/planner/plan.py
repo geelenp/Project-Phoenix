@@ -1,11 +1,16 @@
-from dataclasses import dataclass
+"""
+Project Phoenix
+
+Execution plan.
+"""
+
+from dataclasses import dataclass, field
 
 
-@dataclass(slots=True, frozen=True)
+@dataclass(slots=True)
 class Plan:
     """
-    Decision produced by the planner.
+    Execution plan produced by the planner.
     """
 
-    charge: bool
-    reason: str
+    actions: list = field(default_factory=list)

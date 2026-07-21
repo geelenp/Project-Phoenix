@@ -1,148 +1,234 @@
-# Project Phoenix - Architecture
+# Project Phoenix Architecture
 
-## Doel
+## Purpose
 
-Project Phoenix is een lokaal Energy Management System (EMS) dat het energieverbruik van een woning optimaliseert.
+Project Phoenix is a local Energy Management System (EMS) that optimizes residential energy flows.
 
-Phoenix verzamelt gegevens uit verschillende bronnen, berekent de actuele energietoestand en neemt vervolgens beslissingen om toestellen aan te sturen.
+The system collects measurements from multiple sources, maintains a central Energy State, determines the current energy situation and generates an execution plan for connected devices.
 
 ---
 
-## Architectuuroverzicht
+# Architecture Overview
 
 ```
-                PHOENIX
-                   │
-          Adapter Manager
-                   │
-              Readers
-                   │
-            Energy State
-                   │
-         Decision Context
-                   │
-              Planner
-                   │
-              Executor
-                   │
-             Actuators
-```
-
----
-
-## Componenten
-
-### Phoenix
-
-Phoenix bestuurt de volledige applicatie.
-
-Verantwoordelijkheden:
-
-- starten van het systeem
-- uitvoeren van de hoofdloop
-- aanroepen van de verschillende componenten
-
-Phoenix bevat geen businesslogica.
-
----
-
-### Adapter Manager
-
-De Adapter Manager vormt de brug tussen Phoenix en alle externe databronnen.
-
-Verantwoordelijkheden:
-
-- registreren van readers
-- bepalen wanneer een reader uitgevoerd wordt
-- readers uitvoeren
-- fouten afhandelen
-
-De Adapter Manager bewaart zelf geen meetgegevens.
-
----
-
-### Readers
-
-Elke integratie bevat een reader.
-
-Een reader:
-
-- leest precies één externe databron
-- vertaalt de gegevens naar een standaard Python dictionary
-- bevat geen businesslogica
-- is stateless
-
-Elke integratie bestaat uit:
-
-```
-config.py
-client.py
-reader.py
+                         Home Assistant
+                              │
+                     MQTT Discovery / REST
+                              │
+         ┌────────────────────┴────────────────────┐
+         │                                         │
+     MQTT Publisher                        REST API
+         │                                         │
+         └────────────────────┬────────────────────┘
+                              │
+                        Decision Output
+                              ▲
+                              │
+Readers → Energy State → calculate() → Decision Context
+                                      │
+                                      ▼
+                                  Targets
+                                      │
+                                      ▼
+                                 Constraints
+                                      │
+                                      ▼
+                                   Planner
+                                      │
+                                      ▼
+                                     Plan
+                                      │
+                                      ▼
+                                   Executor
+                                      │
+                                      ▼
+                                  Actuators
 ```
 
 ---
 
-### Energy State
+# Architecture
 
-De Energy State is de Single Source of Truth van Phoenix.
+## Phoenix
 
-Alle actuele gegevens bevinden zich hier.
+Phoenix starts the application, initializes all modules and executes the main loop.
 
-Bij een succesvolle polling worden gegevens bijgewerkt.
-
-Bij een pollingfout blijft de vorige geldige waarde behouden.
-
-Elke dataset bevat een timestamp zodat latere componenten kunnen bepalen hoe oud de informatie is.
+Phoenix itself contains no business logic.
 
 ---
 
-### Decision Context
+## Manager
 
-De Decision Context vertaalt de ruwe Energy State naar informatie waarop beslissingen genomen kunnen worden.
+The Manager controls all Readers.
 
-Voorbeelden:
+Responsibilities:
 
-- overschot PV
-- goedkoop laden
-- voertuig aangesloten
-- batterij bijna vol
+- initialize readers
+- execute readers according to their polling interval
+- update the Energy State
+- isolate reader failures
 
----
-
-### Planner
-
-De Planner bepaalt wat Phoenix wil doen.
-
-Hij bevat uitsluitend beslissingslogica.
-
-De Planner stuurt geen hardware rechtstreeks aan.
+The Manager contains no energy logic.
 
 ---
 
-### Executor
+## Readers
 
-De Executor vertaalt een plan naar concrete acties.
+Readers retrieve data from external systems.
 
-Bijvoorbeeld:
+Each Reader:
 
-- laadstroom wijzigen
-- batterij laden
-- batterij ontladen
+- communicates with one external system
+- converts data into the internal format
+- updates the Energy State
+- contains no business logic
 
----
-
-### Actuators
-
-Actuators communiceren met de fysieke apparaten.
-
-Ze voeren uitsluitend opdrachten uit.
+Readers are independent and stateless.
 
 ---
 
-## Ontwerpprincipes
+## Energy State
 
-- Energy State is de Single Source of Truth.
-- Readers zijn stateless.
-- Elke component heeft één duidelijke verantwoordelijkheid.
-- Businesslogica bevindt zich uitsluitend in de Planner.
-- Hardwarekennis blijft beperkt tot Readers en Actuators.
+The Energy State is the single source of truth of Project Phoenix.
+
+It contains the latest known values received from all Readers.
+
+If a Reader fails, previously received values remain available until updated.
+
+---
+
+## calculate()
+
+The calculate() module derives additional values from the Energy State.
+
+Examples include:
+
+- household consumption
+- battery power
+- available PV surplus
+- energy balance
+
+The calculated values are added to the Energy State.
+
+---
+
+## Decision Context
+
+The Decision Context converts measurements into information that can be used for decision making.
+
+Examples include:
+
+- surplus available
+- battery nearly full
+- vehicle connected
+- cheap electricity
+- forecast shortage
+
+---
+
+## Targets
+
+Targets describe the desired system behaviour.
+
+Examples include:
+
+- maximize self-consumption
+- minimize energy costs
+- maintain battery reserve
+
+Targets define *what* the system wants to achieve.
+
+---
+
+## Constraints
+
+Constraints define operational limits.
+
+Examples include:
+
+- battery limits
+- charger limits
+- hardware capabilities
+- user settings
+
+Constraints define *what is allowed*.
+
+---
+
+## Planner
+
+The Planner combines:
+
+- Decision Context
+- Targets
+- Constraints
+
+The result is a hardware-independent execution Plan.
+
+---
+
+## Plan
+
+The Plan contains the intended actions.
+
+Examples:
+
+- charge EV at 8 A
+- charge battery
+- stop export
+
+The Plan contains no hardware-specific implementation.
+
+---
+
+## Executor
+
+The Executor translates the Plan into device-specific commands.
+
+---
+
+## Actuators
+
+Actuators communicate with physical hardware.
+They execute commands and contain no decision logic.
+
+---
+
+## Output Layer
+
+Several modules publish information for external consumers.
+
+These include:
+
+- Energy State
+- Decision Context
+- Plan
+
+The information can be published through:
+
+- MQTT
+- REST
+- Logger
+
+These modules never influence decision making.
+
+---
+
+## Home Assistant
+
+Home Assistant is the user interface of Project Phoenix.
+It visualizes data, allows user interaction and can issue commands.
+Energy management decisions remain entirely within Project Phoenix.
+
+---
+
+# Design Principles
+
+- Energy State is the single source of truth.
+- Readers and Actuators isolate hardware-specific code.
+- Every module has a single responsibility.
+- Decision making is separated from hardware control.
+- The Planner produces hardware-independent Plans.
+- The Executor performs hardware-specific execution.
+- Home Assistant is a presentation layer only.
+- VS Code is the source of truth for the project.

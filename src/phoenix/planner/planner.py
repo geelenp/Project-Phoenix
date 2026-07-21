@@ -1,4 +1,9 @@
-from phoenix.planner.context import DecisionContext
+"""
+Project Phoenix
+
+Planner.
+"""
+
 from phoenix.planner.plan import Plan
 
 
@@ -7,21 +12,24 @@ class Planner:
     Phoenix EMS planner.
     """
 
-    def create_plan(self, context: DecisionContext) -> Plan:
+    def create_plan(self, state, context, targets) -> Plan:
+        """
+        Build an execution plan from the current state,
+        decision context and policy targets.
+        """
 
-        if not context.car_connected:
-            return Plan(
-                charge=False,
-                reason="No EV connected",
-            )
+        plan = Plan()
 
-        if (context.grid_power or 0) < 0:
-            return Plan(
-                charge=True,
-                reason="Grid export available",
-            )
+        #
+        # Battery planning
+        #
 
-        return Plan(
-            charge=False,
-            reason="Waiting for surplus",
-        )
+        #
+        # EV planning
+        #
+
+        #
+        # Boiler planning
+        #
+
+        return plan

@@ -7,15 +7,26 @@ Derive values from the raw Energy State.
 from datetime import UTC, datetime
 
 
+def value(device, key, default=None):
+    """
+    Safely retrieve a value from a device measurement.
+    """
+
+    if device is None:
+        return default
+
+    return device.get(key, default)
+
+
 def calculate(state):
     """
     Enrich the Energy State with derived values.
     """
 
-    grid = state["grid"]["power"]
-    pv = state["pv"]["power"]
-    battery = state["battery"]["power"]
-    charger = state["charger"]["power"]
+    grid = value(state["grid"], "power", 0)
+    pv = value(state["pv"], "power", 0)
+    battery = value(state["battery"], "power", 0)
+    charger = value(state["charger"], "power", 0)
 
     state["power"] = {
         "grid": grid,
@@ -30,26 +41,26 @@ def calculate(state):
     }
 
     state["energy"] = {
-        "grid_import": state["grid"]["energy_import_kwh"],
-        "grid_export": state["grid"]["energy_export_kwh"],
-        "pv_total": state["pv"]["energy_total_kwh"],
+        "grid_import": value(state["grid"], "energy_import_kwh"),
+        "grid_export": value(state["grid"], "energy_export_kwh"),
+        "pv_total": value(state["pv"], "energy_total_kwh"),
     }
 
     state["status"] = {
-        "battery_soc": state["battery"]["soc"],
-        "vehicle_soc": state["vehicle"]["soc"],
-        "vehicle_connected": state["vehicle"]["connected"],
-        "vehicle_charging": state["vehicle"]["charging"],
+        "battery_soc": value(state["battery"], "soc"),
+        "vehicle_soc": value(state["vehicle"], "soc"),
+        "vehicle_connected": value(state["vehicle"], "connected", False),
+        "vehicle_charging": value(state["vehicle"], "charging", False),
     }
 
     now = datetime.now(UTC)
 
     state["timestamps"] = {
-        "grid": state["grid"]["generated"],
-        "battery": state["battery"]["generated"],
-        "charger": state["charger"]["generated"],
-        "vehicle": state["vehicle"]["generated"],
-        "pv": state["pv"]["generated"],
+        "grid": value(state["grid"], "generated"),
+        "battery": value(state["battery"], "generated"),
+        "charger": value(state["charger"], "generated"),
+        "vehicle": value(state["vehicle"], "generated"),
+        "pv": value(state["pv"], "generated"),
         "calculated": now,
     }
 

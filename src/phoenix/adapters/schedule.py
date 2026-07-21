@@ -33,7 +33,11 @@ SCHEDULE = {
 
     # Scheduled
     "forecast": {
-        "times": [],
+        "times": [
+            time(6, 0),
+            time(11, 0),
+            time(16, 0),
+        ],
     },
 
     "prices": {

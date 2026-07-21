@@ -5,7 +5,7 @@ Create an execution plan from the Decision Context.
 """
 
 
-def create_plan(state, context):
+def create_plan(state, context, targets):
     """
     Create an execution plan.
 
@@ -22,6 +22,15 @@ def create_plan(state, context):
                 "action": "set_power",
                 "value": 0,
                 "reason": "vehicle_not_connected",
+            }
+        )
+
+    elif context["vehicle_charging"]:
+        plan.append(
+            {
+                "target": "charger",
+                "action": "keep_power",
+                "reason": "vehicle_charging",
             }
         )
 

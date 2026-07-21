@@ -27,3 +27,5 @@ tools/entsoe/config.py
 
 # SDM120M
 tools/sdm120m/config.py
+
+phoenix.log
